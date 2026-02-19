@@ -1302,7 +1302,7 @@ dependencies = [
 [[package]]
 name = "btlightning"
 version = "0.1.0"
-source = "git+https://github.com/inference-labs-inc/lightning?rev=aa91070b6e3db517ef3324528b13b1922d586b20#aa91070b6e3db517ef3324528b13b1922d586b20"
+source = "git+https://github.com/inference-labs-inc/lightning?rev=9b85556ee83cbc822094f6cf1f2cc271e6ca7ce3#9b85556ee83cbc822094f6cf1f2cc271e6ca7ce3"
 dependencies = [
  "async-trait",
  "base64 0.21.7",
@@ -6153,7 +6153,6 @@ dependencies = [
  "clap",
  "hex",
  "reqwest",
- "rmpv",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -6191,7 +6190,6 @@ dependencies = [
  "rand 0.8.5",
  "reqwest",
  "rmp-serde",
- "rmpv",
  "serde",
  "serde_json",
  "sha2 0.10.9",
