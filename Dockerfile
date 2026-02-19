@@ -54,6 +54,13 @@ COPY --from=builder /build/target/release/sn2-miner /usr/local/bin/sn2-miner
 RUN cat <<'EOF' > /entrypoint.sh
 #!/usr/bin/env bash
 set -e
+
+cmd="$1"
+case "$cmd" in
+    miner.py)     echo "Remapping miner.py -> sn2-miner" >&2; shift; set -- sn2-miner "$@" ;;
+    validator.py) echo "Remapping validator.py -> sn2-validator" >&2; shift; set -- sn2-validator "$@" ;;
+esac
+
 if [ -n "$PUID" ]; then
     if [ "$PUID" = "0" ]; then
         exec "$@"
