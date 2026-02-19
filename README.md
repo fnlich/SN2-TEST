@@ -34,7 +34,7 @@ The reward mechanism scores the initial AI predictions based on the cryptographi
 ### Validators
 
 - Produce input data and distribute requests for verified inference throughout miners participating on the subnet
-- Confirm that miners are acting faithfully, by verifying the authenticity of the miner's returned zero knowledge proof
+- Confirm that miners are acting faithfully, by verifying the authenticity of the miner's returned zero-knowledge proof
 - Score results from miners based on performance metrics such as proof size and response time
 
 ## Quickstart
@@ -47,27 +47,24 @@ The reward mechanism scores the initial AI predictions based on the cryptographi
 | [PM2](https://pm2.keymetrics.io/) | Process manager used to run and monitor the binaries in the background |
 | [btcli](https://docs.bittensor.com/getting-started/installation) | CLI for interacting with the Bittensor network (wallet creation, registration) |
 
-Alternatively, use Docker — no Rust toolchain needed. See the [Docker instructions](#docker) below.
+Alternatively, use Docker — no Rust toolchain needed. See the Docker instructions under [Run the Miner](#run-the-miner) and [Run the Validator](#run-the-validator) below.
 
 ### Install from pre-built binary
 
-Download the latest release for your platform from [GitHub Releases](https://github.com/inference-labs-inc/subnet-2/releases):
-
-**Linux (x86_64):**
+Automatically detects your platform, downloads the latest release, verifies the SHA256 checksum, and installs to `/usr/local/bin`:
 
 ```console
-curl -L -o sn2-miner https://github.com/inference-labs-inc/subnet-2/releases/latest/download/sn2-miner-linux-x86_64
-curl -L -o sn2-validator https://github.com/inference-labs-inc/subnet-2/releases/latest/download/sn2-validator-linux-x86_64
-chmod +x sn2-miner sn2-validator
+curl -fsSL https://raw.githubusercontent.com/inference-labs-inc/subnet-2/main/install.sh | bash
 ```
 
-**macOS (Apple Silicon):**
+To install only the miner or validator:
 
 ```console
-curl -L -o sn2-miner https://github.com/inference-labs-inc/subnet-2/releases/latest/download/sn2-miner-macos-aarch64
-curl -L -o sn2-validator https://github.com/inference-labs-inc/subnet-2/releases/latest/download/sn2-validator-macos-aarch64
-chmod +x sn2-miner sn2-validator
+curl -fsSL https://raw.githubusercontent.com/inference-labs-inc/subnet-2/main/install.sh | bash -s -- sn2-miner
+curl -fsSL https://raw.githubusercontent.com/inference-labs-inc/subnet-2/main/install.sh | bash -s -- sn2-validator
 ```
+
+Or download manually from [GitHub Releases](https://github.com/inference-labs-inc/subnet-2/releases).
 
 ### Build from source
 
@@ -225,7 +222,7 @@ pm2 start ./sn2-validator --name subnet-2-validator --kill-timeout 3000 -- \
 
 ## Miner
 
-Miners contribute to this subnet by providing compute to generate output from, and prove AI model inferences. Miners receive workloads from validators in the form of input data, perform verified inferences on those inputs and respond with output along with a zero knowledge proof of inference.
+Miners contribute to this subnet by providing compute to generate output from, and prove AI model inferences. Miners receive workloads from validators in the form of input data, perform verified inferences on those inputs and respond with output along with a zero-knowledge proof of inference.
 
 ### Hardware requirements
 
