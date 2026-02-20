@@ -22,7 +22,7 @@ jobs:
 
       - name: Install system dependencies
         run: |
-          dnf install -y clang llvm-devel pkg-config openssl-devel libudev-devel protobuf-compiler python3.12-devel
+          dnf install -y clang llvm-devel pkg-config openssl-devel libudev-devel protobuf-compiler python3.12-devel perl-IPC-Cmd
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
