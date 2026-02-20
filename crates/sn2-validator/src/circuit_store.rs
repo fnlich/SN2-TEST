@@ -223,6 +223,9 @@ impl CircuitStore {
                 let slices_dir = cache_path.join("slices");
                 std::fs::create_dir_all(&slices_dir).ok();
             }
+
+            let mut deferred_downloads: Vec<(String, PathBuf)> = Vec::new();
+
             for (filename, url_val) in files {
                 let skip = if is_dsperse {
                     filename == "full_model.onnx"
@@ -243,10 +246,39 @@ impl CircuitStore {
                     continue;
                 }
                 if let Some(url) = url_val.as_str() {
-                    if let Err(e) = self.download_file(url, &dest).await {
+                    if is_dsperse && filename.ends_with(".dslice") {
+                        deferred_downloads.push((url.to_string(), dest));
+                    } else if let Err(e) = self.download_file(url, &dest).await {
                         warn!(file = %filename, error = %e, "failed to download circuit file");
                     }
                 }
+            }
+
+            if !deferred_downloads.is_empty() {
+                let count = deferred_downloads.len();
+                let http = self.http.clone();
+                info!(circuit = %circuit_id, files = count, "spawning background dslice downloads");
+                tokio::spawn(async move {
+                    let mut downloaded = 0usize;
+                    for (url, dest) in &deferred_downloads {
+                        if dest.exists() {
+                            downloaded += 1;
+                            continue;
+                        }
+                        match download_file_static(&http, url, dest).await {
+                            Ok(()) => {
+                                downloaded += 1;
+                                if downloaded % 20 == 0 || downloaded == count {
+                                    info!(progress = %format!("{downloaded}/{count}"), "dslice download progress");
+                                }
+                            }
+                            Err(e) => {
+                                warn!(file = %dest.display(), error = %e, "failed to download dslice file");
+                            }
+                        }
+                    }
+                    info!(count = downloaded, "dslice background downloads complete");
+                });
             }
         }
 
@@ -307,23 +339,26 @@ impl CircuitStore {
     }
 
     async fn download_file(&self, url: &str, dest: &Path) -> Result<()> {
-        let resp = self
-            .http
-            .get(url)
-            .timeout(std::time::Duration::from_secs(300))
-            .send()
-            .await
-            .context("downloading file")?;
-
-        if !resp.status().is_success() {
-            anyhow::bail!("download returned {}", resp.status());
-        }
-
-        let bytes = resp.bytes().await.context("reading download body")?;
-        std::fs::write(dest, &bytes).with_context(|| format!("writing {}", dest.display()))?;
-
-        Ok(())
+        download_file_static(&self.http, url, dest).await
     }
+}
+
+async fn download_file_static(http: &reqwest::Client, url: &str, dest: &Path) -> Result<()> {
+    let resp = http
+        .get(url)
+        .timeout(std::time::Duration::from_secs(300))
+        .send()
+        .await
+        .context("downloading file")?;
+
+    if !resp.status().is_success() {
+        anyhow::bail!("download returned {}", resp.status());
+    }
+
+    let bytes = resp.bytes().await.context("reading download body")?;
+    std::fs::write(dest, &bytes).with_context(|| format!("writing {}", dest.display()))?;
+
+    Ok(())
 }
 
 fn load_circuit_from_cache(circuit_id: &str, dir: &Path, cache_dir: &Path) -> Result<Circuit> {
