@@ -3,9 +3,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use btlightning::{LightningClient, QuicAxonInfo, QuicRequest};
+use btlightning::{LightningClient, QuicAxonInfo, QuicRequest, Signer};
 use sha2::{Digest, Sha256};
 use sn2_chain::Wallet;
+use tracing::info;
+
+struct WalletSigner(Arc<Wallet>);
+
+impl Signer for WalletSigner {
+    fn sign(&self, message: &[u8]) -> btlightning::Result<Vec<u8>> {
+        self.0
+            .sign_hotkey(message)
+            .map_err(|e| btlightning::LightningError::Signing(e.to_string()))
+    }
+}
 
 pub struct MinerQueryClient {
     lightning: LightningClient,
@@ -15,7 +26,8 @@ pub struct MinerQueryClient {
 
 impl MinerQueryClient {
     pub fn new(wallet: Arc<Wallet>) -> Result<Self> {
-        let lightning = LightningClient::new(wallet.hotkey_ss58().to_string());
+        let mut lightning = LightningClient::new(wallet.hotkey_ss58().to_string());
+        lightning.set_signer(Box::new(WalletSigner(wallet.clone())));
         let http = reqwest::Client::builder()
             .pool_max_idle_per_host(64)
             .tcp_nodelay(true)
@@ -27,6 +39,16 @@ impl MinerQueryClient {
             http,
             wallet,
         })
+    }
+
+    pub async fn init_quic(&mut self) -> Result<()> {
+        self.lightning
+            .initialize_connections(vec![])
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            .context("initializing QUIC endpoint")?;
+        info!("QUIC endpoint initialized");
+        Ok(())
     }
 
     pub fn build_signing_headers(

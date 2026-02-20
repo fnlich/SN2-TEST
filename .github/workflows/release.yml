@@ -26,15 +26,14 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
           echo "$HOME/.cargo/bin" >> $GITHUB_PATH
 
-      - name: Cache Cargo registry and build artifacts
+      - name: Cache Cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: linux-x86_64-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: linux-x86_64-cargo-
+          key: linux-x86_64-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: linux-x86_64-registry-
 
       - name: Build release binaries
         run: |
@@ -71,15 +70,14 @@ jobs:
       - name: Install system dependencies
         run: brew install protobuf
 
-      - name: Cache Cargo registry and build artifacts
+      - name: Cache Cargo registry
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            target
-          key: macos-aarch64-cargo-${{ hashFiles('Cargo.lock') }}
-          restore-keys: macos-aarch64-cargo-
+          key: macos-aarch64-registry-${{ hashFiles('Cargo.lock') }}
+          restore-keys: macos-aarch64-registry-
 
       - name: Build release binaries
         run: cargo build --release --locked --bin sn2-validator --bin sn2-miner

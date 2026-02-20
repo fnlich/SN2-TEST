@@ -254,6 +254,13 @@ impl ValidatorLoop {
         self.circuit_store.load_circuits().await?;
         self.relay.start().await?;
 
+        {
+            let mut client = self.miner_client.write().await;
+            if let Err(e) = client.init_quic().await {
+                warn!(error = %e, "QUIC endpoint init failed, QUIC queries will be unavailable");
+            }
+        }
+
         info!(
             uid = self.config.user_uid,
             netuid = self.config.netuid,
