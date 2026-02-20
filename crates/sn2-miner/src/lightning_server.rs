@@ -19,8 +19,11 @@ pub async fn run_lightning_server(
 ) -> Result<()> {
     let mut server = LightningServer::new(miner_hotkey.to_string(), host.to_string(), port);
 
+    // btlightning's from_wallet passes (path, hotkey_name) to Wallet::new in
+    // swapped positions: path→hotkey slot, hotkey_name→path slot. Compensate
+    // by swapping here so the correct values reach bittensor_wallet::Wallet::new.
     server
-        .set_miner_wallet(wallet_name, wallet_path, hotkey_name)
+        .set_miner_wallet(wallet_name, hotkey_name, wallet_path)
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     let h = handlers.clone();
