@@ -50,8 +50,8 @@ impl WeightsSetter {
         );
         let storage = client.storage().at_latest().await?;
         match storage.fetch(&query).await? {
-            Some(val) => Ok(val.to_value()?.as_bool().unwrap_or(false)),
-            None => Ok(false),
+            Some(val) => Ok(val.to_value()?.as_bool().unwrap_or(true)),
+            None => Ok(true),
         }
     }
 
