@@ -47,4 +47,10 @@ pub struct Cli {
 
     #[arg(long, default_value_t = false)]
     pub no_auto_update: bool,
+
+    #[arg(long)]
+    pub proof_api_url: Option<String>,
+
+    #[arg(long)]
+    pub max_benchmark_concurrent: Option<usize>,
 }

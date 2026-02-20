@@ -1,17 +1,33 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use sha2::{Digest, Sha256};
 use sn2_types::{Circuit, DSliceProofGenerationDataModel, ProofSystem, Request, RequestType};
 
+const MAX_HASHES: usize = 32768;
+
 pub struct RequestPipeline {
     hash_guard: HashSet<String>,
+    hash_order: VecDeque<String>,
 }
 
 impl RequestPipeline {
     pub fn new() -> Self {
         Self {
             hash_guard: HashSet::new(),
+            hash_order: VecDeque::new(),
         }
+    }
+
+    fn insert_hash(&mut self, hash: String) {
+        while self.hash_guard.len() >= MAX_HASHES {
+            if let Some(oldest) = self.hash_order.pop_front() {
+                self.hash_guard.remove(&oldest);
+            } else {
+                break;
+            }
+        }
+        self.hash_guard.insert(hash.clone());
+        self.hash_order.push_back(hash);
     }
 
     pub fn check_hash(&mut self, inputs: &serde_json::Value) -> Option<String> {
@@ -19,13 +35,12 @@ impl RequestPipeline {
         if self.hash_guard.contains(&hash) {
             return None;
         }
-        self.hash_guard.insert(hash.clone());
+        self.insert_hash(hash.clone());
         Some(hash)
     }
 
     pub fn prepare_benchmark_request(
         &mut self,
-        _uid: u16,
         circuit: &Circuit,
         inputs: serde_json::Value,
     ) -> Option<Request> {
@@ -33,7 +48,7 @@ impl RequestPipeline {
         if self.hash_guard.contains(&hash) {
             return None;
         }
-        self.hash_guard.insert(hash);
+        self.insert_hash(hash);
 
         Some(Request {
             circuit: circuit.clone(),
@@ -66,10 +81,14 @@ impl RequestPipeline {
 
     pub fn release_hash(&mut self, hash: &str) {
         self.hash_guard.remove(hash);
+        if let Some(pos) = self.hash_order.iter().position(|h| h == hash) {
+            self.hash_order.remove(pos);
+        }
     }
 
     pub fn clear_guard(&mut self) {
         self.hash_guard.clear();
+        self.hash_order.clear();
     }
 }
 

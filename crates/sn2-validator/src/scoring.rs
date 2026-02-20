@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use tracing::{info, warn};
 
-use sn2_types::{DEFAULT_MAX_SCORE, PERFORMANCE_CURVE_POWER, PERFORMANCE_MIN_SAMPLES};
+use sn2_types::{PERFORMANCE_CURVE_POWER, PERFORMANCE_MIN_SAMPLES};
 
 const RATE_OF_DECAY: f64 = 0.4;
 const RATE_OF_RECOVERY: f64 = 0.1;
@@ -39,9 +39,10 @@ impl ScoreManager {
         response_time: f64,
         max_response_time: f64,
         min_response_time: f64,
+        metagraph_n: u16,
     ) {
         let previous_score = self.get_score(uid);
-        let maximum_score = DEFAULT_MAX_SCORE;
+        let maximum_score = 1.0 / (metagraph_n.max(1) as f64);
 
         let rate_of_change = if verified {
             RATE_OF_RECOVERY
@@ -80,6 +81,29 @@ impl ScoreManager {
         self.scores.retain(|uid, _| active_uids.contains(uid));
         for &uid in active_uids {
             self.scores.entry(uid).or_insert(0.0);
+        }
+    }
+
+    pub fn apply_pow_scores(&mut self, miner_uids: &[u16], scores: &[f64]) {
+        if miner_uids.len() != scores.len() {
+            warn!(
+                miner_uids_len = miner_uids.len(),
+                scores_len = scores.len(),
+                "apply_pow_scores length mismatch, using minimum"
+            );
+        }
+        for (&uid, &score) in miner_uids.iter().zip(scores.iter()) {
+            if self.scores.contains_key(&uid) {
+                self.scores.insert(uid, score.max(0.0));
+            }
+        }
+    }
+
+    pub fn zero_non_queryable(&mut self, queryable_uids: &HashSet<u16>) {
+        for (uid, score) in self.scores.iter_mut() {
+            if !queryable_uids.contains(uid) {
+                *score = 0.0;
+            }
         }
     }
 

@@ -20,6 +20,9 @@ pub struct ValidatorConfig {
     pub disable_benchmark: bool,
     pub metrics_port: u16,
     pub dsperse_socket: Option<String>,
+    pub proof_api_url: Option<String>,
+    pub is_testnet: bool,
+    pub max_benchmark_concurrent: Option<usize>,
 }
 
 impl ValidatorConfig {
@@ -75,6 +78,9 @@ impl ValidatorConfig {
             disable_benchmark: cli.disable_benchmark,
             metrics_port: cli.metrics_port,
             dsperse_socket: cli.dsperse_socket.clone(),
+            proof_api_url: cli.proof_api_url.clone(),
+            is_testnet: matches!(cli.network.as_str(), "test" | "testnet"),
+            max_benchmark_concurrent: cli.max_benchmark_concurrent,
         })
     }
 }
