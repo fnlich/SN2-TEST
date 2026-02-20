@@ -85,12 +85,20 @@ async fn main() -> Result<()> {
 
     let metagraph = Arc::new(RwLock::new(metagraph));
 
-    let external_ip: std::net::IpAddr = cli
-        .external_ip
-        .as_deref()
-        .unwrap_or("0.0.0.0")
-        .parse()
-        .context("parsing external IP")?;
+    let external_ip: std::net::IpAddr = match cli.external_ip.as_deref() {
+        Some(ip) => ip.parse().context("parsing external IP")?,
+        None => {
+            let resp = reqwest::get("https://api.ipify.org")
+                .await
+                .context("detecting external IP")?
+                .text()
+                .await
+                .context("reading external IP response")?;
+            resp.trim()
+                .parse()
+                .with_context(|| format!("parsing detected IP: {resp}"))?
+        }
+    };
 
     let http_port = cli.axon_port;
     let quic_port = cli.quic_port;
@@ -140,10 +148,15 @@ async fn main() -> Result<()> {
         })
     };
 
-    registration
+    match registration
         .serve_axon(&chain_client, &wallet, external_ip, http_port, 4)
         .await
-        .context("registering axon on chain")?;
+    {
+        Ok(()) => {}
+        Err(e) => {
+            warn!(error = %e, "serve_axon failed (rate-limited or transient); miner will continue");
+        }
+    }
 
     info!(
         hotkey = %wallet.hotkey_ss58(),
