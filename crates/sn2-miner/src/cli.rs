@@ -47,4 +47,14 @@ pub struct Cli {
 
     #[arg(long, default_value_t = false)]
     pub no_auto_update: bool,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "[TESTING ONLY] Disable validator permit checks — bypasses all on-chain permit enforcement"
+    )]
+    pub disable_blacklist: bool,
+
+    #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(30..), help = "Metagraph sync interval in seconds")]
+    pub metagraph_sync_interval: u64,
 }
