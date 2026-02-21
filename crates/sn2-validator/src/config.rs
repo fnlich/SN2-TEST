@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -23,6 +24,7 @@ pub struct ValidatorConfig {
     pub proof_api_url: Option<String>,
     pub is_testnet: bool,
     pub max_benchmark_concurrent: Option<usize>,
+    pub target_uids: Option<HashSet<u16>>,
 }
 
 impl ValidatorConfig {
@@ -91,6 +93,11 @@ impl ValidatorConfig {
             proof_api_url: cli.proof_api_url.clone(),
             is_testnet: matches!(cli.network.as_str(), "test" | "testnet"),
             max_benchmark_concurrent: cli.max_benchmark_concurrent,
+            target_uids: if cli.target_uid.is_empty() {
+                None
+            } else {
+                Some(cli.target_uid.iter().copied().collect())
+            },
         })
     }
 }

@@ -42,9 +42,6 @@ pub struct Cli {
     #[arg(long, default_value_t = 9090)]
     pub metrics_port: u16,
 
-    #[arg(long)]
-    pub dsperse_socket: Option<String>,
-
     #[arg(long, default_value_t = false)]
     pub no_auto_update: bool,
 
@@ -53,4 +50,7 @@ pub struct Cli {
 
     #[arg(long)]
     pub max_benchmark_concurrent: Option<usize>,
+
+    #[arg(long, value_delimiter = ',')]
+    pub target_uid: Vec<u16>,
 }

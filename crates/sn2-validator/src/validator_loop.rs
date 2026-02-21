@@ -955,12 +955,6 @@ impl ValidatorLoop {
     }
 
     fn get_queryable_neurons(&self) -> Vec<&sn2_chain::NeuronInfo> {
-        let target_uids: Option<HashSet<u16>> = std::env::var("TARGET_UIDS").ok().map(|s| {
-            s.split(',')
-                .filter_map(|v| v.trim().parse::<u16>().ok())
-                .collect()
-        });
-
         let stake_threshold = if self.config.is_testnet {
             u64::MAX
         } else {
@@ -972,7 +966,7 @@ impl ValidatorLoop {
             .neurons
             .iter()
             .filter(|n| {
-                if let Some(targets) = &target_uids {
+                if let Some(targets) = &self.config.target_uids {
                     return targets.contains(&n.uid);
                 }
                 if n.stake >= stake_threshold {
@@ -1563,8 +1557,8 @@ impl ValidatorLoop {
             }
         }
 
-        if std::env::var("TARGET_UIDS").is_ok() {
-            info!("TARGET_UIDS set, skipping non-queryable score zeroing");
+        if self.config.target_uids.is_some() {
+            info!("target_uids set, skipping non-queryable score zeroing");
         } else {
             let queryable = self.get_queryable_neurons();
             for n in &queryable {
