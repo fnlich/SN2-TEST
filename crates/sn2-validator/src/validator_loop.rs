@@ -787,7 +787,7 @@ impl ValidatorLoop {
                     }
                 } else if api_eligible.contains(&uid) && !self.api_dslice_queue.is_empty() {
                     let mut dslice = self.api_dslice_queue.pop_front().unwrap();
-                    if dslice.inputs.is_null() {
+                    if dslice.inputs.is_null() && dslice.outputs.is_none() {
                         let tid = dslice.task_id.as_deref().unwrap_or("");
                         match self.dsperse.get_work_data(tid).await {
                             Ok(data) => {
@@ -833,7 +833,7 @@ impl ValidatorLoop {
                         break;
                     }
                 } else if let Some(mut dslice) = self.stacked_dslice_queue.pop_front() {
-                    if dslice.inputs.is_null() {
+                    if dslice.inputs.is_null() && dslice.outputs.is_none() {
                         let tid = dslice.task_id.as_deref().unwrap_or("");
                         match self.dsperse.get_work_data(tid).await {
                             Ok(data) => {
