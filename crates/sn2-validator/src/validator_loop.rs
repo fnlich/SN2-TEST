@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use btlightning::QuicAxonInfo;
 use sn2_chain::{PendingReveal, WeightsSetter};
 use sn2_types::*;
-use tokio::sync::{Notify, RwLock};
+use tokio::sync::{Notify, RwLock, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
@@ -176,6 +176,7 @@ pub struct ValidatorLoop {
     weight_tasks: JoinSet<WeightTaskResult>,
     dsperse_benchmark_backoff_until: Instant,
     pending_benchmark_run: Option<BenchmarkRunHandle>,
+    file_load_semaphore: Arc<Semaphore>,
 }
 
 impl ValidatorLoop {
@@ -260,6 +261,7 @@ impl ValidatorLoop {
             weight_tasks: JoinSet::new(),
             dsperse_benchmark_backoff_until: now,
             pending_benchmark_run: None,
+            file_load_semaphore: Arc::new(Semaphore::new(3)),
         })
     }
 
@@ -934,6 +936,7 @@ impl ValidatorLoop {
                 };
 
                 let client = Arc::clone(&self.miner_client);
+                let file_sem = Arc::clone(&self.file_load_semaphore);
 
                 let task_slice_num = slice_num.clone();
                 let task_run_uid = run_uid.clone();
@@ -947,6 +950,14 @@ impl ValidatorLoop {
 
                 let abort_handle = self.tasks.spawn(async move {
                     let tokio_task_id = tokio::task::id();
+
+                    let _file_permit = if request_type == RequestType::DSlice
+                        && task_inputs_path_clone.is_some()
+                    {
+                        Some(file_sem.acquire().await)
+                    } else {
+                        None
+                    };
 
                     let mut body = body;
                     if request_type == RequestType::DSlice {
@@ -973,7 +984,7 @@ impl ValidatorLoop {
                             placeholder2: 0,
                         };
                         let data: HashMap<String, serde_json::Value> =
-                            serde_json::from_value(body.clone()).unwrap_or_default();
+                            serde_json::from_value(body).unwrap_or_default();
                         guard
                             .query_miner_quic(&axon, synapse_name, data, timeout)
                             .await
