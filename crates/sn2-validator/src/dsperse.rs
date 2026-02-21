@@ -219,8 +219,8 @@ impl DSperseManager {
         stream.read_exact(&mut len_buf).await?;
         let resp_len = u32::from_be_bytes(len_buf) as usize;
         anyhow::ensure!(
-            resp_len <= 64 * 1024 * 1024,
-            "IPC response length {resp_len} exceeds 64MB cap"
+            resp_len <= 512 * 1024 * 1024,
+            "IPC response length {resp_len} exceeds 512MB cap"
         );
 
         let mut resp_buf = vec![0u8; resp_len];
@@ -252,8 +252,8 @@ async fn send_and_receive_standalone(
         stream.read_exact(&mut len_buf).await?;
         let resp_len = u32::from_be_bytes(len_buf) as usize;
         anyhow::ensure!(
-            resp_len <= 64 * 1024 * 1024,
-            "IPC response length {resp_len} exceeds 64MB cap"
+            resp_len <= 512 * 1024 * 1024,
+            "IPC response length {resp_len} exceeds 512MB cap"
         );
 
         let mut resp_buf = vec![0u8; resp_len];
