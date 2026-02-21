@@ -1089,7 +1089,8 @@ impl ValidatorLoop {
 
         self.config
             .metagraph
-            .active_neurons()
+            .neurons
+            .iter()
             .filter(|n| {
                 if let Some(targets) = &target_uids {
                     return targets.contains(&n.uid);
