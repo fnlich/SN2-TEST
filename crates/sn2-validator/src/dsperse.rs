@@ -183,15 +183,6 @@ impl DSperseManager {
         self.send_ipc(&request).await
     }
 
-    pub async fn get_work_data(&self, task_id: &str) -> Result<serde_json::Value> {
-        let request = serde_json::json!({
-            "method": "get_work_data",
-            "task_id": task_id,
-        });
-
-        self.send_ipc(&request).await
-    }
-
     async fn send_ipc(&self, request: &serde_json::Value) -> Result<serde_json::Value> {
         let payload = serde_json::to_vec(request)?;
         self.send_and_receive(&payload, DEFAULT_TIMEOUT_SECS).await
