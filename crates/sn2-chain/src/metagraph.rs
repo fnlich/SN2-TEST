@@ -262,7 +262,6 @@ impl Metagraph {
 
         let neurons: Vec<Option<NeuronInfo>> = stream::iter(0..n)
             .map(|uid| {
-                let storage = storage;
                 let validator_permits = &validator_permits;
                 let ranks = &ranks;
                 let trusts = &trusts;
