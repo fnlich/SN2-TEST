@@ -1765,6 +1765,20 @@ impl ValidatorLoop {
         let uids = self.config.metagraph.uids();
         self.score_manager.sync_uids(&uids);
 
+        for n in &self.config.metagraph.neurons {
+            if !n.axon_ip.is_empty() && n.axon_port > 0 {
+                info!(
+                    uid = n.uid,
+                    ip = %n.axon_ip,
+                    port = n.axon_port,
+                    protocol = n.axon_protocol,
+                    active = n.is_active,
+                    hotkey = %n.hotkey,
+                    "neuron with axon"
+                );
+            }
+        }
+
         if std::env::var("TARGET_UIDS").is_ok() {
             info!("TARGET_UIDS set, skipping non-queryable score zeroing");
         } else {
