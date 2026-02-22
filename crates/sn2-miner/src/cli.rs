@@ -36,9 +36,6 @@ pub struct Cli {
     #[arg(long, alias = "axon.external_ip")]
     pub external_ip: Option<String>,
 
-    #[arg(long)]
-    pub dsperse_socket: Option<String>,
-
     #[arg(long, default_value = "competition_circuit")]
     pub circuit_dir: String,
 

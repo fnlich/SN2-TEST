@@ -87,13 +87,7 @@ impl MinerHandlers {
 
         let result = self
             .dsperse
-            .prove_slice(
-                circuit_id,
-                slice_num,
-                &data.inputs.unwrap_or(json!({})),
-                data.outputs.as_ref(),
-                &data.proof_system.to_string(),
-            )
+            .prove_slice(circuit_id, slice_num, &data.inputs.unwrap_or(json!({})))
             .await?;
 
         Ok(result)

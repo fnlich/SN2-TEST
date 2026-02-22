@@ -103,7 +103,7 @@ async fn main() -> Result<()> {
     let http_port = cli.axon_port;
     let quic_port = cli.quic_port;
 
-    let dsperse = dsperse::DSperseClient::new(cli.dsperse_socket.clone());
+    let dsperse = dsperse::DSperseClient::new();
     let circuit_mgr = std::sync::Arc::new(circuit_manager::CircuitManager::new(
         &cli.circuit_dir,
         cli.storage_bucket.as_deref(),
