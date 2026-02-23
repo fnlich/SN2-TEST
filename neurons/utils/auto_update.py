@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import subprocess
 import sys
 import time
@@ -58,10 +59,20 @@ PYTHON_ONLY_VALUE_ARGS = frozenset({
 })
 
 
+_SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+")
+
+
+def _is_release_tag(tag: git.Tag) -> bool:
+    return bool(_SEMVER_RE.match(tag.name))
+
+
 def get_version() -> Optional[str]:
     try:
         repo = git.Repo(search_parent_directories=True)
-        tags = sorted(repo.tags, key=lambda t: t.commit.committed_datetime)
+        tags = sorted(
+            (t for t in repo.tags if _is_release_tag(t)),
+            key=lambda t: t.commit.committed_datetime,
+        )
         return tags[-1].name if tags else None
     except Exception:
         return None
@@ -94,11 +105,11 @@ class AutoUpdate:
             logging.exception("Failed to initialize the repository", e)
 
     def get_local_latest_tag(self) -> Optional[git.Tag]:
-        """
-        Get the latest tag from the local git repository
-        """
         try:
-            tags = sorted(self.repo.tags, key=lambda t: t.commit.committed_datetime)
+            tags = sorted(
+                (t for t in self.repo.tags if _is_release_tag(t)),
+                key=lambda t: t.commit.committed_datetime,
+            )
             current_tag: Optional[git.Tag] = tags[-1] if tags else None
             if current_tag:
                 logging.info(f"Current tag: {current_tag.name}")
