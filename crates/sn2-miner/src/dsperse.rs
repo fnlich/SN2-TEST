@@ -1,7 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use sn2_types::json_tensor::{flatten_json_to_f64, infer_json_shape};
+use sn2_types::json_tensor::flatten_json_to_f64;
 use tracing::info;
 
 pub struct DSperseClient {
@@ -88,7 +88,10 @@ impl DSperseClient {
 
         tokio::task::spawn_blocking(move || -> Result<serde_json::Value> {
             let input_flat = flatten_json_to_f64(&input_data);
-            let input_shape = infer_json_shape(&input_data);
+            anyhow::ensure!(
+                !input_flat.is_empty(),
+                "invalid input tensor: flattened input is empty"
+            );
 
             let backend = dsperse::backend::jstprove::JstproveBackend::new();
             let params = backend
@@ -96,41 +99,41 @@ impl DSperseClient {
                 .map_err(|e| anyhow::anyhow!("loading circuit params: {e}"))?;
             let is_wai = params.as_ref().is_some_and(|p| p.weights_as_inputs);
 
-            let witness_bytes = if is_wai {
-                let inits = dsperse::pipeline::extract_onnx_initializers(
-                    &onnx_path,
-                    params.as_ref().unwrap(),
-                )
-                .map_err(|e| anyhow::anyhow!("extracting initializers: {e}"))?;
-                backend
-                    .witness_f64(&circuit_path, &input_flat, &inits)
-                    .map_err(|e| anyhow::anyhow!("witness generation (WAI): {e}"))?
+            let inits = if is_wai {
+                dsperse::pipeline::extract_onnx_initializers(&onnx_path, params.as_ref().unwrap())
+                    .map_err(|e| anyhow::anyhow!("extracting initializers: {e}"))?
             } else {
-                let (output_data, _) =
-                    dsperse::backend::onnx::run_inference(&onnx_path, &input_flat, &input_shape)
-                        .map_err(|e| anyhow::anyhow!("onnx inference: {e}"))?;
-                let input_msgpack =
-                    rmp_serde::to_vec_named(&serde_json::json!({ "input_data": &input_data }))?;
-                let output_msgpack =
-                    rmp_serde::to_vec_named(&serde_json::json!({ "output_data": output_data }))?;
-                backend
-                    .witness(&circuit_path, &input_msgpack, &output_msgpack)
-                    .map_err(|e| anyhow::anyhow!("witness generation: {e}"))?
+                Vec::new()
             };
+
+            let witness_bytes = backend
+                .witness_f64(&circuit_path, &input_flat, &inits)
+                .map_err(|e| anyhow::anyhow!("witness generation: {e}"))?;
 
             let proof_bytes = backend
                 .prove(&circuit_path, &witness_bytes)
                 .map_err(|e| anyhow::anyhow!("proof generation: {e}"))?;
 
+            let computed_outputs = if let Some(ref p) = params {
+                let num_model_inputs = p.effective_input_dims();
+                backend
+                    .extract_outputs(&witness_bytes, num_model_inputs)
+                    .map_err(|e| anyhow::anyhow!("extracting outputs: {e}"))?
+            } else {
+                Vec::new()
+            };
+
             info!(
                 witness_size = witness_bytes.len(),
                 proof_size = proof_bytes.len(),
+                num_outputs = computed_outputs.len(),
                 "witness and proof generated"
             );
 
             Ok(serde_json::json!({
                 "proof": hex::encode(&proof_bytes),
                 "witness": hex::encode(&witness_bytes),
+                "computed_outputs": computed_outputs,
             }))
         })
         .await
@@ -163,6 +166,10 @@ impl DSperseClient {
             let inputs_bytes = rmp_serde::to_vec_named(&inputs_clone)?;
             let backend = dsperse::backend::jstprove::JstproveBackend::new();
 
+            let params = backend
+                .load_params(&circuit_path)
+                .map_err(|e| anyhow::anyhow!("loading circuit params: {e}"))?;
+
             let witness_bytes = backend
                 .witness(&circuit_path, &inputs_bytes, &[])
                 .map_err(|e| anyhow::anyhow!("witness generation: {e}"))?;
@@ -171,9 +178,19 @@ impl DSperseClient {
                 .prove(&circuit_path, &witness_bytes)
                 .map_err(|e| anyhow::anyhow!("proof generation: {e}"))?;
 
+            let computed_outputs = if let Some(ref p) = params {
+                let num_model_inputs = p.effective_input_dims();
+                backend
+                    .extract_outputs(&witness_bytes, num_model_inputs)
+                    .map_err(|e| anyhow::anyhow!("extracting outputs: {e}"))?
+            } else {
+                Vec::new()
+            };
+
             Ok(serde_json::json!({
                 "proof": hex::encode(&proof_bytes),
                 "witness": hex::encode(&witness_bytes),
+                "computed_outputs": computed_outputs,
             }))
         })
         .await
