@@ -17,10 +17,11 @@ pub struct CircuitStore {
     api_url: String,
     cache_dir: PathBuf,
     http: reqwest::Client,
+    loopback: bool,
 }
 
 impl CircuitStore {
-    pub fn new(api_url_override: Option<&str>) -> Self {
+    pub fn new(api_url_override: Option<&str>, loopback: bool) -> Self {
         let cache_dir = shellexpand::tilde(CIRCUIT_CACHE_DIR).to_string();
         Self {
             circuits: HashMap::new(),
@@ -30,10 +31,18 @@ impl CircuitStore {
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_default(),
+            loopback,
         }
     }
 
     pub async fn load_circuits(&mut self) -> Result<()> {
+        if self.loopback {
+            info!("loopback mode: loading all circuits from local cache");
+            self.load_from_cache(&std::collections::HashSet::new());
+            info!(count = self.circuits.len(), "circuits loaded");
+            return Ok(());
+        }
+
         let api_circuits = self.fetch_circuits_from_api().await.unwrap_or_else(|e| {
             warn!(error = %e, "failed to fetch circuits from API, loading from cache only");
             Vec::new()
