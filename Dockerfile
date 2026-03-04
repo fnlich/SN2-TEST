@@ -1,4 +1,4 @@
-FROM --platform=linux/amd64 rust:1.85.0-bookworm AS builder
+FROM --platform=linux/amd64 rust:1.91.0-bookworm AS builder
 
 RUN apt-get update && apt-get install -y \
     clang \
