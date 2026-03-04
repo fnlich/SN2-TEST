@@ -3,7 +3,6 @@ use anyhow::{Context, Result};
 pub struct Wallet {
     hotkey: bittensor_wallet::Keypair,
     hotkey_ss58: String,
-    coldkey_ss58: String,
     pub name: String,
     pub hotkey_name: String,
     pub wallet_path: String,
@@ -22,17 +21,9 @@ impl Wallet {
             .get_hotkey(None)
             .map_err(|e| anyhow::anyhow!("loading hotkey: {:?}", e))?;
 
-        let coldkeypub = bt_wallet
-            .get_coldkeypub(None)
-            .map_err(|e| anyhow::anyhow!("loading coldkeypub: {:?}", e))?;
-
         let hotkey_ss58 = hotkey
             .ss58_address()
             .context("no ss58 address for hotkey")?;
-
-        let coldkey_ss58 = coldkeypub
-            .ss58_address()
-            .context("no ss58 address for coldkeypub")?;
 
         let resolved_path = match wallet_path {
             Some(p) => p.to_string(),
@@ -45,7 +36,6 @@ impl Wallet {
         Ok(Wallet {
             hotkey,
             hotkey_ss58,
-            coldkey_ss58,
             name: name.to_string(),
             hotkey_name: hotkey_name.to_string(),
             wallet_path: resolved_path,
@@ -54,10 +44,6 @@ impl Wallet {
 
     pub fn hotkey_ss58(&self) -> &str {
         &self.hotkey_ss58
-    }
-
-    pub fn coldkey_ss58(&self) -> &str {
-        &self.coldkey_ss58
     }
 
     pub fn sign_hotkey(&self, data: &[u8]) -> Result<Vec<u8>> {
