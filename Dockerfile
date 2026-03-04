@@ -11,6 +11,8 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
+COPY rust-toolchain.toml ./
+RUN rustup show
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
 

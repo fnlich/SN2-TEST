@@ -392,8 +392,7 @@ mod tests {
         let other = anyhow::anyhow!("some random error");
         assert!(!is_connection_error(&other));
 
-        let serialization =
-            anyhow::Error::from(LightningError::Serialization("bad format".into()));
+        let serialization = anyhow::Error::from(LightningError::Serialization("bad format".into()));
         assert!(!is_connection_error(&serialization));
     }
 
