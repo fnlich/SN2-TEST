@@ -15,7 +15,6 @@ sn2-verify = { workspace = true }
 sn2-circuit-store = { workspace = true }
 btlightning = { workspace = true }
 tokio = { workspace = true }
-serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -26,7 +25,6 @@ tokio-tungstenite = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 uuid = { workspace = true }
-rmp-serde = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 subxt = { workspace = true }
@@ -36,3 +34,4 @@ dirs-next = { workspace = true }
 futures-util = { workspace = true }
 dsperse = { workspace = true }
 ndarray = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }

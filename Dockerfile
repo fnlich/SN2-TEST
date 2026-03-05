@@ -16,7 +16,8 @@ RUN rustup show
 COPY Cargo.toml Cargo.lock ./
 COPY crates crates
 
-RUN cargo build --release --bin sn2-validator --bin sn2-miner
+ARG SN2_VERSION=dev
+RUN SN2_VERSION=${SN2_VERSION} cargo build --release --bin sn2-validator --bin sn2-miner
 
 FROM --platform=linux/amd64 debian:bookworm-20250224-slim
 
@@ -36,7 +37,10 @@ RUN mkdir -p /opt/.nvm /opt/.snarkjs && \
     chown -R subnet2:subnet2 /opt/.nvm /opt/.snarkjs
 
 USER subnet2
-RUN curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.0/install.sh | bash && \
+RUN curl -o /tmp/install_nvm.sh https://raw.githubusercontent.com/nvm-sh/nvm/v0.40.0/install.sh && \
+    echo 'bdea8c52186c4dd12657e77e7515509cda5bf9fa5a2f0046bce749e62645076d /tmp/install_nvm.sh' | sha256sum --check && \
+    bash /tmp/install_nvm.sh && \
+    rm /tmp/install_nvm.sh && \
     export NVM_DIR="$NVM_DIR" && \
     [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" && \
     nvm install 20 && \

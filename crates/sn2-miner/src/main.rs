@@ -1,4 +1,3 @@
-mod circuit_manager;
 mod cli;
 mod dsperse;
 mod handlers;
@@ -10,6 +9,8 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::watch;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
@@ -19,23 +20,19 @@ use crate::cli::Cli;
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                tracing_subscriber::EnvFilter::try_new(&cli.log_level).unwrap_or_else(|e| {
-                    eprintln!("invalid --log-level \"{}\": {e}", cli.log_level);
-                    std::process::exit(1);
-                })
-            }),
-        )
-        .init();
+    sn2_types::init_tracing(&cli.log_level);
+
+    info!(version = sn2_types::SOFTWARE_VERSION, "sn2-miner");
 
     if cli.loopback {
         return run_loopback(cli).await;
     }
 
+    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+
     if !cli.no_auto_update && option_env!("SN2_RELEASE_CHANNEL") == Some("mainnet") {
-        let _update_handle = sn2_chain::auto_update::spawn_update_loop("sn2-miner");
+        let _update_handle =
+            sn2_chain::auto_update::spawn_update_loop("sn2-miner", shutdown_tx.clone());
     }
 
     info!(
@@ -54,14 +51,7 @@ async fn main() -> Result<()> {
     );
 
     let endpoint =
-        cli.subtensor_chain_endpoint
-            .clone()
-            .unwrap_or_else(|| match cli.network.as_str() {
-                "finney" | "mainnet" => sn2_chain::FINNEY_ENDPOINT.to_string(),
-                "test" | "testnet" => sn2_chain::TEST_ENDPOINT.to_string(),
-                "local" | "localnet" => sn2_chain::LOCAL_ENDPOINT.to_string(),
-                other => other.to_string(),
-            });
+        sn2_chain::resolve_endpoint(&cli.network, cli.subtensor_chain_endpoint.as_deref());
 
     let chain_client = subxt::OnlineClient::<subxt::PolkadotConfig>::from_url(&endpoint)
         .await
@@ -75,17 +65,14 @@ async fn main() -> Result<()> {
         .await
         .context("initial metagraph sync")?;
 
-    if metagraph.get_uid_by_hotkey(wallet.hotkey_ss58()).is_none() {
-        error!(
-            hotkey = %wallet.hotkey_ss58(),
-            netuid = cli.netuid,
-            network = %cli.network,
-            "Hotkey is not registered on subnet. Register with: btcli subnets register --netuid {} --network {}",
-            cli.netuid,
-            cli.network,
-        );
-        std::process::exit(1);
-    }
+    anyhow::ensure!(
+        metagraph.get_uid_by_hotkey(wallet.hotkey_ss58()).is_some(),
+        "hotkey {} is not registered on subnet {}. Register with: btcli subnets register --netuid {} --network {}",
+        wallet.hotkey_ss58(),
+        cli.netuid,
+        cli.netuid,
+        cli.network,
+    );
 
     let metagraph = Arc::new(RwLock::new(metagraph));
 
@@ -110,22 +97,9 @@ async fn main() -> Result<()> {
 
     let dsperse = dsperse::DSperseClient::new();
 
-    let mut circuit_store =
-        sn2_circuit_store::CircuitStore::new(None, false, cli.additional_circuits.clone());
-    for id in &cli.additional_circuits {
-        if let Err(e) = circuit_store.ensure_circuit(id).await {
-            warn!(id = %id, error = %e, "failed to preload pinned circuit");
-        }
-    }
+    let circuit_store = init_circuit_store(false, &cli.additional_circuits).await;
 
-    let circuit_mgr = std::sync::Arc::new(circuit_manager::CircuitManager::new(
-        &cli.circuit_dir,
-        cli.storage_bucket.as_deref(),
-    ));
-
-    let circuit_monitor = circuit_mgr.clone().start_monitor();
-
-    let handlers = handlers::MinerHandlers::new(dsperse, circuit_mgr, circuit_store);
+    let handlers = handlers::MinerHandlers::new(dsperse, circuit_store);
     let handlers = std::sync::Arc::new(handlers);
 
     let disable_blacklist = cli.disable_blacklist;
@@ -209,15 +183,14 @@ async fn main() -> Result<()> {
         })
     };
 
+    let mut sigterm = signal(SignalKind::terminate()).context("registering SIGTERM handler")?;
+
     tokio::select! {
         r = http_handle => {
             r?.context("HTTP server")?;
         }
         r = quic_handle => {
             r?.context("QUIC server")?;
-        }
-        _ = circuit_monitor => {
-            warn!("circuit monitor exited unexpectedly");
         }
         r = metagraph_sync => {
             match r {
@@ -227,6 +200,12 @@ async fn main() -> Result<()> {
         }
         _ = tokio::signal::ctrl_c() => {
             info!("shutting down miner");
+        }
+        _ = sigterm.recv() => {
+            info!("received SIGTERM, shutting down miner");
+        }
+        _ = async { loop { shutdown_rx.changed().await.ok()?; if *shutdown_rx.borrow() { return Some(()); } } } => {
+            info!("shutting down miner for auto-update restart");
         }
     }
 
@@ -241,22 +220,9 @@ async fn run_loopback(cli: Cli) -> Result<()> {
 
     let dsperse = dsperse::DSperseClient::new();
 
-    let mut circuit_store =
-        sn2_circuit_store::CircuitStore::new(None, true, cli.additional_circuits.clone());
-    for id in &cli.additional_circuits {
-        if let Err(e) = circuit_store.ensure_circuit(id).await {
-            warn!(id = %id, error = %e, "failed to preload pinned circuit");
-        }
-    }
+    let circuit_store = init_circuit_store(true, &cli.additional_circuits).await;
 
-    let circuit_mgr = std::sync::Arc::new(circuit_manager::CircuitManager::new(
-        &cli.circuit_dir,
-        cli.storage_bucket.as_deref(),
-    ));
-
-    let circuit_monitor = circuit_mgr.clone().start_monitor();
-
-    let handlers = handlers::MinerHandlers::new(dsperse, circuit_mgr, circuit_store);
+    let handlers = handlers::MinerHandlers::new(dsperse, circuit_store);
     let handlers = std::sync::Arc::new(handlers);
 
     let metagraph = Arc::new(RwLock::new(sn2_chain::Metagraph::new(cli.netuid)));
@@ -274,17 +240,33 @@ async fn run_loopback(cli: Cli) -> Result<()> {
 
     info!(port = cli.axon_port, "miner loopback running");
 
+    let mut sigterm = signal(SignalKind::terminate()).context("registering SIGTERM handler")?;
+
     tokio::select! {
         r = http_handle => {
             r?.context("HTTP server")?;
         }
-        r = circuit_monitor => {
-            r.context("circuit monitor")?;
-        }
         _ = tokio::signal::ctrl_c() => {
             info!("shutting down miner");
+        }
+        _ = sigterm.recv() => {
+            info!("received SIGTERM, shutting down miner");
         }
     }
 
     Ok(())
+}
+
+async fn init_circuit_store(
+    loopback: bool,
+    additional_circuits: &[String],
+) -> sn2_circuit_store::CircuitStore {
+    let mut store =
+        sn2_circuit_store::CircuitStore::new(None, loopback, additional_circuits.to_vec());
+    for id in additional_circuits {
+        if let Err(e) = store.ensure_circuit(id).await {
+            warn!(id = %id, error = %e, "failed to preload pinned circuit");
+        }
+    }
+    store
 }

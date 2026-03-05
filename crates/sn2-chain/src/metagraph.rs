@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 
 use anyhow::{Context, Result};
 use futures_util::stream::{self, StreamExt};
@@ -210,15 +211,8 @@ impl Metagraph {
                 let coldkey = sp_core::crypto::AccountId32::new(raw.coldkey).to_ss58check();
                 let total_stake: u64 = raw.stake.iter().map(|(_, s)| s.0).sum();
 
-                let ip_raw = raw.axon_info.ip as u32;
                 let axon_ip = if raw.axon_info.ip_type == 4 {
-                    format!(
-                        "{}.{}.{}.{}",
-                        (ip_raw >> 24) & 0xFF,
-                        (ip_raw >> 16) & 0xFF,
-                        (ip_raw >> 8) & 0xFF,
-                        ip_raw & 0xFF,
-                    )
+                    Ipv4Addr::from(raw.axon_info.ip as u32).to_string()
                 } else {
                     String::new()
                 };
@@ -342,23 +336,8 @@ impl Metagraph {
             .and_then(|uids| uids.first().copied())
     }
 
-    pub fn get_uids_by_coldkey(&self, coldkey: &str) -> &[u16] {
-        self.coldkey_to_uids
-            .get(coldkey)
-            .map(|v| v.as_slice())
-            .unwrap_or(&[])
-    }
-
     pub fn uids(&self) -> Vec<u16> {
         self.neurons.iter().map(|n| n.uid).collect()
-    }
-
-    pub fn hotkeys(&self) -> Vec<&str> {
-        self.neurons.iter().map(|n| n.hotkey.as_str()).collect()
-    }
-
-    pub fn stakes(&self) -> Vec<u64> {
-        self.neurons.iter().map(|n| n.stake).collect()
     }
 
     pub fn active_neurons(&self) -> impl Iterator<Item = &NeuronInfo> {
@@ -547,13 +526,7 @@ async fn query_axon(
             let port = v.at("port").and_then(|v| v.as_u128()).unwrap_or(0) as u16;
             let protocol = v.at("protocol").and_then(|v| v.as_u128()).unwrap_or(0) as u8;
 
-            let ip = format!(
-                "{}.{}.{}.{}",
-                (ip_raw >> 24) & 0xFF,
-                (ip_raw >> 16) & 0xFF,
-                (ip_raw >> 8) & 0xFF,
-                ip_raw & 0xFF,
-            );
+            let ip = Ipv4Addr::from(ip_raw).to_string();
 
             Ok((ip, port, protocol))
         }

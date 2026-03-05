@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use subxt::{OnlineClient, PolkadotConfig};
-use tracing::{error, info};
+use tracing::info;
 
 use sn2_chain::{Metagraph, NeuronInfo, Wallet};
 
@@ -34,14 +34,7 @@ pub struct ValidatorConfig {
 impl ValidatorConfig {
     pub async fn from_cli(cli: &Cli) -> Result<Self> {
         let endpoint =
-            cli.subtensor_chain_endpoint
-                .clone()
-                .unwrap_or_else(|| match cli.network.as_str() {
-                    "finney" | "mainnet" => sn2_chain::FINNEY_ENDPOINT.to_string(),
-                    "test" | "testnet" => sn2_chain::TEST_ENDPOINT.to_string(),
-                    "local" | "localnet" => sn2_chain::LOCAL_ENDPOINT.to_string(),
-                    other => other.to_string(),
-                });
+            sn2_chain::resolve_endpoint(&cli.network, cli.subtensor_chain_endpoint.as_deref());
 
         let chain_client = OnlineClient::<PolkadotConfig>::from_url(&endpoint)
             .await
@@ -65,15 +58,13 @@ impl ValidatorConfig {
         let user_uid = match metagraph.get_uid_by_hotkey(wallet.hotkey_ss58()) {
             Some(uid) => uid,
             None => {
-                error!(
-                    hotkey = %wallet.hotkey_ss58(),
-                    netuid = cli.netuid,
-                    network = %cli.network,
-                    "Hotkey is not registered on subnet. Register with: btcli subnets register --netuid {} --network {}",
+                anyhow::bail!(
+                    "hotkey {} is not registered on subnet {}. Register with: btcli subnets register --netuid {} --network {}",
+                    wallet.hotkey_ss58(),
+                    cli.netuid,
                     cli.netuid,
                     cli.network,
                 );
-                std::process::exit(1);
             }
         };
 
@@ -89,7 +80,7 @@ impl ValidatorConfig {
             chain_endpoint: endpoint,
             metagraph,
             user_uid,
-            relay_enabled: cli.relay_enabled,
+            relay_enabled: !cli.no_relay,
             relay_url,
             max_concurrency: cli.max_concurrency,
             api_miners_pct: cli.api_miners_pct,

@@ -7,11 +7,13 @@ use anyhow::{Context, Result};
 use btlightning::QuicAxonInfo;
 use sn2_chain::{PendingReveal, WeightsSetter};
 use sn2_types::*;
-use tokio::sync::{Notify, RwLock};
+use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::{watch, Notify, RwLock};
 use tokio::task::JoinSet;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config::ValidatorConfig;
+use crate::dsperse_events::DsperseEventClient;
 use crate::incremental_runner::{IncrementalRunManager, SliceArtifact};
 use crate::miner_client::MinerQueryClient;
 use crate::performance::PerformanceTracker;
@@ -97,6 +99,9 @@ pub struct ValidatorLoop {
     weight_tasks: JoinSet<WeightTaskResult>,
     dsperse_benchmark_backoff_until: Instant,
     stats_reporter: Option<StatsReporter>,
+    dsperse_events: Option<Arc<DsperseEventClient>>,
+    dsperse_flush_task: Option<tokio::task::JoinHandle<()>>,
+    dsperse_emit_tasks: JoinSet<()>,
 }
 
 impl ValidatorLoop {
@@ -121,9 +126,16 @@ impl ValidatorLoop {
         let (dsperse_tx, dsperse_rx) = tokio::sync::mpsc::channel::<DsperseSubmission>(256);
         let (rwr_tx, rwr_rx) = tokio::sync::mpsc::channel::<RwrSubmission>(256);
 
-        let (miner_client, relay, proof_uploader, stats_reporter) = if config.loopback {
+        let (
+            miner_client,
+            relay,
+            proof_uploader,
+            stats_reporter,
+            dsperse_events,
+            dsperse_flush_task,
+        ) = if config.loopback {
             let client = MinerQueryClient::new_unsigned()?;
-            (Arc::new(RwLock::new(client)), None, None, None)
+            (Arc::new(RwLock::new(client)), None, None, None, None, None)
         } else {
             let wallet = config
                 .wallet
@@ -145,16 +157,28 @@ impl ValidatorLoop {
                 None
             } else {
                 Some(StatsReporter::new(
-                    wallet,
+                    wallet.clone(),
                     config.proof_api_url.clone(),
                     config.user_uid,
                 ))
+            };
+            let (events, flush_task) = if config.disable_metric_logging {
+                (None, None)
+            } else {
+                let ec = Arc::new(DsperseEventClient::new(
+                    wallet,
+                    config.proof_api_url.clone(),
+                ));
+                let handle = ec.spawn_flush_loop();
+                (Some(ec), Some(handle))
             };
             (
                 Arc::new(RwLock::new(client)),
                 Some(relay),
                 Some(uploader),
                 reporter,
+                events,
+                flush_task,
             )
         };
 
@@ -207,10 +231,13 @@ impl ValidatorLoop {
             weight_tasks: JoinSet::new(),
             dsperse_benchmark_backoff_until: now,
             stats_reporter,
+            dsperse_events,
+            dsperse_flush_task,
+            dsperse_emit_tasks: JoinSet::new(),
         })
     }
 
-    pub async fn run(&mut self) -> Result<()> {
+    pub async fn run(&mut self, mut update_shutdown_rx: watch::Receiver<bool>) -> Result<()> {
         self.circuit_store.load_circuits().await?;
         if let Some(relay) = &mut self.relay {
             relay.start().await?;
@@ -235,6 +262,7 @@ impl ValidatorLoop {
 
         let mut tick =
             tokio::time::interval(Duration::from_millis((LOOP_DELAY_SECONDS * 1000.0) as u64));
+        let mut sigterm = signal(SignalKind::terminate()).context("registering SIGTERM handler")?;
 
         loop {
             tokio::select! {
@@ -285,6 +313,16 @@ impl ValidatorLoop {
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("shutting down validator");
+                    self.shutdown().await;
+                    return Ok(());
+                }
+                _ = sigterm.recv() => {
+                    info!("received SIGTERM, shutting down validator");
+                    self.shutdown().await;
+                    return Ok(());
+                }
+                _ = async { loop { update_shutdown_rx.changed().await.ok()?; if *update_shutdown_rx.borrow() { return Some(()); } } } => {
+                    info!("shutting down validator for auto-update restart");
                     self.shutdown().await;
                     return Ok(());
                 }
@@ -397,7 +435,18 @@ impl ValidatorLoop {
             Some(incremental),
         );
 
-        let (total_slices, total_tiles) = self.run_manager.slice_tile_counts(&run_uid);
+        let (total_slices, total_tiles, stc) = self.run_manager.slice_tile_counts(&run_uid);
+
+        if let Some(ev) = &self.dsperse_events {
+            let ev = Arc::clone(ev);
+            let uid = run_uid.clone();
+            let cid = circuit.id.clone();
+            let cname = circuit.metadata.name.clone();
+            self.dsperse_emit_tasks.spawn(async move {
+                ev.emit_run_started(&uid, &cid, &cname, total_slices, total_tiles, &stc, "api")
+                    .await;
+            });
+        }
 
         self.relay_register_pending(&run_uid).await;
 
@@ -514,6 +563,8 @@ impl ValidatorLoop {
                         let active_run = self.run_manager.remove_run(run_uid);
                         if let Some(ref run) = active_run {
                             self.report_dsperse_completion(run);
+
+                            self.spawn_emit_run_complete(run, true);
                         }
                         let notify_circuit_id = active_run
                             .as_ref()
@@ -591,10 +642,11 @@ impl ValidatorLoop {
                     }
                 };
 
+                let num_tiles = tiles.len();
                 info!(
                     run_uid = %run_uid,
                     slice = %slice_info.slice_id,
-                    num_tiles = tiles.len(),
+                    num_tiles,
                     "dispatching spatial tiles"
                 );
 
@@ -629,8 +681,6 @@ impl ValidatorLoop {
                         task_id: None,
                         run_source,
                         retry_count: 0,
-                        inputs_path: None,
-                        outputs_path: None,
                         circuit_path: slice_info.circuit_path.clone(),
                     };
                     match run_source {
@@ -638,6 +688,17 @@ impl ValidatorLoop {
                         RunSource::Benchmark => self.stacked_dslice_queue.push_back(request),
                     };
                 }
+
+                if let Some(ev) = &self.dsperse_events {
+                    let ev = Arc::clone(ev);
+                    let uid = run_uid.to_string();
+                    let snum = slice_info.slice_id.clone();
+                    let nt = num_tiles;
+                    self.dsperse_emit_tasks.spawn(async move {
+                        ev.emit_work_items_created(&uid, &snum, nt).await;
+                    });
+                }
+
                 return;
             }
 
@@ -654,8 +715,6 @@ impl ValidatorLoop {
                 task_id: None,
                 run_source,
                 retry_count: 0,
-                inputs_path: None,
-                outputs_path: None,
                 circuit_path: slice_info.circuit_path.clone(),
             };
             match request.run_source {
@@ -728,6 +787,26 @@ impl ValidatorLoop {
             None,
             Some(incremental),
         );
+
+        if let Some(ev) = &self.dsperse_events {
+            let (total_slices, total_tiles, stc) = self.run_manager.slice_tile_counts(&run_uid);
+            let ev = Arc::clone(ev);
+            let uid = run_uid.clone();
+            let cid = circuit.id.clone();
+            let cname = circuit.metadata.name.clone();
+            self.dsperse_emit_tasks.spawn(async move {
+                ev.emit_run_started(
+                    &uid,
+                    &cid,
+                    &cname,
+                    total_slices,
+                    total_tiles,
+                    &stc,
+                    "benchmark",
+                )
+                .await;
+            });
+        }
 
         let circuit = circuit.clone();
         self.enqueue_next_dslice(&run_uid, &circuit).await;
@@ -1022,7 +1101,6 @@ impl ValidatorLoop {
                 let task_task_id = task_id.clone();
                 let task_circuit_clone = task_circuit;
                 let task_inputs_clone = task_inputs;
-                let task_inputs_path_clone: Option<String> = None;
                 let task_proof_system_clone = task_proof_system;
                 let task_retry_payload = retry_payload;
                 let task_guard_hash = guard_hash.clone();
@@ -1067,7 +1145,6 @@ impl ValidatorLoop {
                                 computed_outputs: None,
                                 is_incremental: request_type == RequestType::DSlice,
                                 witness: None,
-                                inputs_path: task_inputs_path_clone,
                                 dsperse_circuit_path: task_dsperse_circuit_path,
                             };
                             response.proof_size = response
@@ -1241,6 +1318,24 @@ impl ValidatorLoop {
                         info!(uid = uid, elapsed = format!("{elapsed:.3}s"), rtype = %request_type, "proof verified");
 
                         if request_type == RequestType::DSlice {
+                            if let (Some(ev), Some(ref ruid), Some(ref snum)) =
+                                (&self.dsperse_events, &run_uid, &slice_num)
+                            {
+                                let ev = Arc::clone(ev);
+                                let ruid = ruid.clone();
+                                let snum = snum.clone();
+                                self.dsperse_emit_tasks.spawn(async move {
+                                    ev.emit_proof_received(&ruid, &snum, elapsed, uid).await;
+                                    ev.emit_verification_complete(
+                                        &ruid,
+                                        &snum,
+                                        verification_time,
+                                        true,
+                                    )
+                                    .await;
+                                });
+                            }
+
                             self.handle_dslice_success(
                                 &run_uid,
                                 &slice_num,
@@ -1267,6 +1362,19 @@ impl ValidatorLoop {
                         None
                     }
                 } else {
+                    if request_type == RequestType::DSlice {
+                        if let (Some(ev), Some(ref ruid), Some(ref snum)) =
+                            (&self.dsperse_events, &run_uid, &slice_num)
+                        {
+                            let ev = Arc::clone(ev);
+                            let ruid = ruid.clone();
+                            let snum = snum.clone();
+                            let vt = response.verification_time.unwrap_or(0.0);
+                            self.dsperse_emit_tasks.spawn(async move {
+                                ev.emit_verification_complete(&ruid, &snum, vt, false).await;
+                            });
+                        }
+                    }
                     let reason = match verify_result {
                         Ok(false) => "verification failed".to_string(),
                         Err(e) => e.to_string(),
@@ -1491,6 +1599,7 @@ impl ValidatorLoop {
 
                     if let Some(ref run) = active_run {
                         self.report_dsperse_completion(run);
+                        self.spawn_emit_run_complete(run, true);
                     }
 
                     let artifacts = active_run
@@ -1623,8 +1732,29 @@ impl ValidatorLoop {
         });
     }
 
+    fn spawn_emit_run_complete(
+        &mut self,
+        run: &crate::incremental_runner::ActiveRun,
+        completed: bool,
+    ) {
+        if let Some(ev) = &self.dsperse_events {
+            let ev = Arc::clone(ev);
+            let uid = run.run_uid.clone();
+            let all_ok = completed
+                && !run.artifacts.is_empty()
+                && run.artifacts.iter().all(|a| a.proof_hex.is_some());
+            let elapsed = run.started_at.elapsed().as_secs_f64();
+            self.dsperse_emit_tasks.spawn(async move {
+                ev.emit_run_complete(&uid, all_ok, elapsed).await;
+            });
+        }
+    }
+
     async fn teardown_run(&mut self, run_uid: &str) {
-        self.run_manager.remove_run(run_uid);
+        let removed = self.run_manager.remove_run(run_uid);
+        if let Some(ref run) = removed {
+            self.spawn_emit_run_complete(run, false);
+        }
         self.stacked_dslice_queue
             .retain(|req| req.run_uid != run_uid);
         self.api_dslice_queue.retain(|req| req.run_uid != run_uid);
@@ -1639,7 +1769,7 @@ impl ValidatorLoop {
         retry_count: u32,
         retry_payload: RetryPayload,
         run_uid: &Option<String>,
-        _slice_num: &Option<String>,
+        slice_num: &Option<String>,
         _is_tile: bool,
         _task_id: Option<&str>,
         _tile_idx: Option<u32>,
@@ -1697,6 +1827,15 @@ impl ValidatorLoop {
 
         if request_type == RequestType::DSlice {
             if let Some(run_uid) = run_uid {
+                if let (Some(ev), Some(snum)) = (&self.dsperse_events, slice_num) {
+                    let ev = Arc::clone(ev);
+                    let ruid = run_uid.clone();
+                    let snum = snum.clone();
+                    let err = reason.to_string();
+                    self.dsperse_emit_tasks.spawn(async move {
+                        ev.emit_slice_failed(&ruid, &snum, &err).await;
+                    });
+                }
                 warn!(run_uid = %run_uid, "dslice max retries exceeded, removing run");
                 self.teardown_run(run_uid).await;
             }
@@ -1865,6 +2004,8 @@ impl ValidatorLoop {
             }
         }
 
+        while self.dsperse_emit_tasks.try_join_next().is_some() {}
+
         if now.duration_since(self.last_health_log) > Duration::from_secs(15) {
             let active_tasks = self.tasks.len();
             let queue_size = self.rwr_queue.len()
@@ -1932,9 +2073,11 @@ impl ValidatorLoop {
         let uids = self.config.metagraph.uids();
         self.score_manager.sync_uids(&uids);
 
+        let mut axon_count = 0usize;
         for n in &self.config.metagraph.neurons {
             if !n.axon_ip.is_empty() && n.axon_port > 0 {
-                info!(
+                axon_count += 1;
+                debug!(
                     uid = n.uid,
                     ip = %n.axon_ip,
                     port = n.axon_port,
@@ -1947,12 +2090,20 @@ impl ValidatorLoop {
         }
 
         if self.config.target_uids.is_some() {
-            info!("target_uids set, skipping non-queryable score zeroing");
+            info!(
+                neurons_with_axon = axon_count,
+                "target_uids set, skipping non-queryable score zeroing"
+            );
         } else {
             let queryable = self.get_queryable_neurons();
             for n in &queryable {
-                info!(uid = n.uid, ip = %n.axon_ip, port = n.axon_port, protocol = n.axon_protocol, active = n.is_active, "queryable neuron");
+                debug!(uid = n.uid, ip = %n.axon_ip, port = n.axon_port, protocol = n.axon_protocol, active = n.is_active, "queryable neuron");
             }
+            info!(
+                neurons_with_axon = axon_count,
+                queryable = queryable.len(),
+                "metagraph sync complete"
+            );
             let queryable_uids: HashSet<u16> = queryable.iter().map(|n| n.uid).collect();
             self.score_manager.zero_non_queryable(&queryable_uids);
         }
@@ -2213,6 +2364,33 @@ impl ValidatorLoop {
     }
 
     async fn shutdown(&mut self) {
+        while self.dsperse_emit_tasks.join_next().await.is_some() {}
+        if let Some(ev) = &self.dsperse_events {
+            ev.flush().await;
+        }
+        if let Some(handle) = self.dsperse_flush_task.take() {
+            handle.abort();
+        }
+        info!("draining in-flight weight tasks");
+        while let Some(result) = self.weight_tasks.join_next().await {
+            match result {
+                Ok(WeightTaskResult::Committed(pending)) => {
+                    self.pending_reveal = Some(pending);
+                }
+                Ok(WeightTaskResult::CommitFailed(e)) => {
+                    warn!(error = %e, "weight commit failed during shutdown");
+                }
+                Ok(WeightTaskResult::Revealed) => {
+                    info!("weights revealed during shutdown");
+                }
+                Ok(WeightTaskResult::RevealFailed(e)) => {
+                    warn!(error = %e, "weight reveal failed during shutdown");
+                }
+                Err(e) => {
+                    warn!(error = %e, "weight task panicked during shutdown");
+                }
+            }
+        }
         info!("aborting in-flight miner tasks");
         self.tasks.shutdown().await;
         info!("draining in-flight proof uploads");
