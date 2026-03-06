@@ -9,7 +9,7 @@ on:
     types: [labeled, synchronize]
   release:
     types: [created]
-  workflow_dispatch: null
+  workflow_dispatch: {}
 
 env:
   REGISTRY: ghcr.io
@@ -100,6 +100,8 @@ jobs:
           file: ./Dockerfile
           pull: true
           push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           build-args: |
             SN2_VERSION=${{ github.event.release.tag_name }}
           tags: |
