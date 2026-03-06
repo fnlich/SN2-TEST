@@ -851,6 +851,12 @@ impl ValidatorLoop {
     }
 
     async fn dispatch_requests(&mut self) -> Result<()> {
+        let verification_backlog =
+            self.verify_tasks.len() + self.pending_verifications.len();
+        if verification_backlog >= MAX_CONCURRENT_VERIFICATIONS {
+            return Ok(());
+        }
+
         let active_count = self.tasks.len();
         let available_slots = self.config.max_concurrency.saturating_sub(active_count);
         if available_slots == 0 {
