@@ -237,6 +237,10 @@ impl CircuitStore {
         self.circuits.len()
     }
 
+    pub fn cache_dir(&self) -> &Path {
+        &self.cache_dir
+    }
+
     pub const REFRESH_INTERVAL: u64 = REFRESH_INTERVAL_SECS;
 
     async fn fetch_circuits_from_api(&self) -> Result<Vec<serde_json::Value>> {

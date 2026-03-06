@@ -1,13 +1,27 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::{Context, Result};
-use tracing::warn;
+use tracing::{info, warn};
 
 use jstprove_circuits::onnx::verify_and_extract_bn254;
 use jstprove_circuits::runner::main_runner::read_circuit_msgpack;
 
+static CIRCUIT_CACHE: LazyLock<Mutex<HashMap<String, Arc<Vec<u8>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 use crate::protocol::{StoreResponse, VerifyAndStoreRequest, VerifyRequest, VerifyResponse};
 use crate::store::{StoredTile, TileStore};
+
+pub fn evict_circuit_cache(path_prefix: &str) {
+    let mut cache = CIRCUIT_CACHE.lock().unwrap();
+    let before = cache.len();
+    cache.retain(|k, _| !k.starts_with(path_prefix));
+    let evicted = before - cache.len();
+    if evicted > 0 {
+        info!(prefix = %path_prefix, evicted, remaining = cache.len(), "evicted circuit cache entries");
+    }
+}
 
 pub struct VerifyResult {
     pub rescaled_outputs: Vec<f64>,
@@ -30,12 +44,24 @@ pub async fn verify_inner(
     let expected_inputs = expected_inputs.clone();
 
     tokio::task::spawn_blocking(move || -> Result<VerifyResult> {
-        let circuit_bytes = if std::path::Path::new(&circuit_path).is_dir() {
-            let bundle = read_circuit_msgpack(&circuit_path)
-                .map_err(|e| anyhow::anyhow!("reading bundle {circuit_path}: {e}"))?;
-            bundle.circuit
-        } else {
-            std::fs::read(&circuit_path).with_context(|| format!("reading {circuit_path}"))?
+        let circuit_bytes = {
+            let mut cache = CIRCUIT_CACHE.lock().unwrap();
+            if let Some(cached) = cache.get(&circuit_path) {
+                Arc::clone(cached)
+            } else {
+                let bytes = if std::path::Path::new(&circuit_path).is_dir() {
+                    let bundle = read_circuit_msgpack(&circuit_path)
+                        .map_err(|e| anyhow::anyhow!("reading bundle {circuit_path}: {e}"))?;
+                    bundle.circuit
+                } else {
+                    std::fs::read(&circuit_path)
+                        .with_context(|| format!("reading {circuit_path}"))?
+                };
+                info!(path = %circuit_path, size_mb = bytes.len() as f64 / (1024.0 * 1024.0), "cached circuit bytes");
+                let arc = Arc::new(bytes);
+                cache.insert(circuit_path.clone(), Arc::clone(&arc));
+                arc
+            }
         };
         let witness_bytes = hex::decode(witness_hex.trim()).context("hex-decoding witness")?;
         let proof_bytes = hex::decode(proof_hex.trim()).context("hex-decoding proof")?;

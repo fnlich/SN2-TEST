@@ -1678,6 +1678,8 @@ impl ValidatorLoop {
             .and_then(|cid| self.circuit_store.get_circuit(cid))
             .map(|c| c.paths.base_path.join("slices"));
         if let Some(ref sd) = slices_dir {
+            let slice_path = sd.join(slice_num);
+            sn2_verify::evict_circuit_cache(&slice_path.to_string_lossy());
             sn2_circuit_store::cleanup_extracted_slice(sd, slice_num);
         }
 
@@ -2044,6 +2046,8 @@ impl ValidatorLoop {
             match self.circuit_store.refresh_circuits().await {
                 Ok(removed) => {
                     for circuit_id in &removed {
+                        let prefix = self.circuit_store.cache_dir().join(circuit_id);
+                        sn2_verify::evict_circuit_cache(&prefix.to_string_lossy());
                         let evicted = self.run_manager.evict_by_circuit(circuit_id);
                         if !evicted.is_empty() {
                             info!(circuit = %circuit_id, runs = ?evicted, "evicted in-flight runs for deactivated circuit");
