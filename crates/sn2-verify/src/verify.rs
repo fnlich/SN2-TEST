@@ -116,35 +116,32 @@ pub async fn verify_inner(
     let proof_hex = proof_hex.to_string();
     let expected_inputs = expected_inputs.clone();
 
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    std::thread::spawn(move || {
-        let result = (|| -> Result<VerifyResult> {
-            let layered = get_or_load_layered(&circuit_path)?;
-            let witness_bytes = hex::decode(witness_hex.trim()).context("hex-decoding witness")?;
-            let proof_bytes = hex::decode(proof_hex.trim()).context("hex-decoding proof")?;
+    tokio::task::spawn_blocking(move || {
+        let layered = get_or_load_layered(&circuit_path)?;
+        let witness_bytes = hex::decode(witness_hex.trim()).context("hex-decoding witness")?;
+        let proof_bytes = hex::decode(proof_hex.trim()).context("hex-decoding proof")?;
 
-            let result = verify_and_extract_bn254_with_layered(
-                &layered,
-                &witness_bytes,
-                &proof_bytes,
-                num_inputs,
-                expected_inputs.as_deref(),
-            )
-            .map_err(|e| anyhow::anyhow!("verification: {e}"))?;
+        let result = verify_and_extract_bn254_with_layered(
+            &layered,
+            &witness_bytes,
+            &proof_bytes,
+            num_inputs,
+            expected_inputs.as_deref(),
+        )
+        .map_err(|e| anyhow::anyhow!("verification: {e}"))?;
 
-            if !result.valid {
-                anyhow::bail!("proof verification failed");
-            }
+        if !result.valid {
+            anyhow::bail!("proof verification failed");
+        }
 
-            Ok(VerifyResult {
-                rescaled_outputs: result.outputs,
-                scale_base: result.scale_base,
-                scale_exponent: result.scale_exponent,
-            })
-        })();
-        let _ = tx.send(result);
-    });
-    rx.await.context("verification thread panicked")?
+        Ok(VerifyResult {
+            rescaled_outputs: result.outputs,
+            scale_base: result.scale_base,
+            scale_exponent: result.scale_exponent,
+        })
+    })
+    .await
+    .context("verification task panicked")?
 }
 
 pub async fn handle_request(req: VerifyRequest) -> VerifyResponse {
