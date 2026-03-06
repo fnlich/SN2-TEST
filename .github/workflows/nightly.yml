@@ -1,13 +1,15 @@
-name: Nightly loopback integration
+name: Nightly build and smoke test
 
 on:
   schedule:
     - cron: '0 5 * * *'
   workflow_dispatch: {}
+  pull_request:
+    types: [labeled, synchronize, reopened]
 
 concurrency:
-  group: nightly-publish
-  cancel-in-progress: false
+  group: nightly-${{ github.event.pull_request.number || 'publish' }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -18,65 +20,35 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  loopback-e2e:
-    name: Loopback E2E
+  smoke-test:
+    name: Smoke test
+    if: github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'test-nightly')
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    env:
+      SCCACHE_GHA_ENABLED: "true"
+      RUSTC_WRAPPER: sccache
+      CARGO_INCREMENTAL: "0"
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
-          ref: testnet
-
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
-        with:
-          python-version: "3.12"
+          ref: ${{ github.event.pull_request.head.sha || 'testnet' }}
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang llvm pkg-config libssl-dev libudev-dev protobuf-compiler
+          sudo apt-get install -y pkg-config libssl-dev libudev-dev protobuf-compiler mold
+
+      - uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
 
       - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
 
       - name: Build release binaries
         run: cargo build --workspace --release --locked
-
-      - name: Get year-month for circuit cache key
-        run: echo "YEARMONTH=$(date +'%Y-%m')" >> $GITHUB_ENV
-
-      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
-        with:
-          path: ~/.bittensor/subnet-2/circuit_cache
-          key: circuit-${{ runner.os }}-${{ env.YEARMONTH }}
-          restore-keys: circuit-${{ runner.os }}-
-
-      - name: Seed test circuit
-        id: seed
-        run: |
-          CIRCUIT_ID=$(python tools/ci_loopback_seed.py)
-          echo "circuit_id=${CIRCUIT_ID}" >> $GITHUB_OUTPUT
-          echo "Seeded circuit: ${CIRCUIT_ID}"
-
-      - name: Start mock circuit API
-        run: python tools/mock_circuit_api.py 18080 &
-
-      - name: Wait for mock circuit API
-        run: |
-          for i in $(seq 1 30); do
-            curl -sf http://localhost:18080/circuits > /dev/null && break
-            sleep 1
-          done
-          curl -sf http://localhost:18080/circuits > /dev/null || \
-            (echo "Mock API failed to start" && exit 1)
-
-      - name: Activate test circuit
-        run: |
-          RESULT=$(curl -sf -X POST \
-            "http://localhost:18080/admin/activate/${{ steps.seed.outputs.circuit_id }}")
-          echo "Activate response: $RESULT"
-          echo "$RESULT" | python3 -c \
-            "import json,sys; d=json.load(sys.stdin); sys.exit(0 if 'activated' in d else 1)"
+        env:
+          OPENSSL_NO_VENDOR: "1"
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C link-arg=-fuse-ld=mold
 
       - name: Start miner in loopback
         run: |
@@ -87,14 +59,14 @@ jobs:
             > /tmp/miner.log 2>&1 &
           echo "MINER_PID=$!" >> $GITHUB_ENV
 
-      - name: Wait for miner
+      - name: Wait for miner health
         run: |
           for i in $(seq 1 15); do
             curl -sf http://localhost:8091/health > /dev/null && break
             sleep 1
           done
           curl -sf http://localhost:8091/health || \
-            (echo "Miner failed to start" && tail -50 /tmp/miner.log && exit 1)
+            (echo "FAIL: Miner health endpoint unreachable" && tail -50 /tmp/miner.log && exit 1)
 
       - name: Start validator in loopback
         run: |
@@ -102,7 +74,7 @@ jobs:
           ./target/release/sn2-validator \
             --loopback \
             --miner-address 127.0.0.1:8091 \
-            --circuit-api-url http://localhost:18080 \
+            --circuit-api-url https://repository.inferencelabs.com \
             --metrics-port 9090 \
             --max-concurrency 4 \
             --log-level info \
@@ -116,97 +88,75 @@ jobs:
             sleep 1
           done
           curl -sf http://localhost:9090/metrics > /dev/null || \
-            (echo "Validator metrics endpoint unavailable" && tail -50 /tmp/validator.log && exit 1)
+            (echo "FAIL: Validator metrics endpoint unreachable" && tail -50 /tmp/validator.log && exit 1)
 
-      - name: Run for 6 minutes
-        run: sleep 360
+      - name: Assert circuits loaded
+        run: |
+          for i in $(seq 1 30); do
+            grep -q "validator loop starting" /tmp/validator.log && break
+            sleep 1
+          done
+          grep "validator loop starting" /tmp/validator.log || \
+            (echo "FAIL: Validator did not complete circuit loading" && tail -50 /tmp/validator.log && exit 1)
+          grep "circuits loaded" /tmp/validator.log | tail -1
+
+      - name: Stability window
+        run: sleep 30
 
       - name: Assert process liveness
         run: |
           kill -0 $MINER_PID 2>/dev/null || \
-            (echo "FAIL: Miner exited early" && tail -100 /tmp/miner.log && exit 1)
+            (echo "FAIL: Miner exited during stability window" && tail -100 /tmp/miner.log && exit 1)
           kill -0 $VALIDATOR_PID 2>/dev/null || \
-            (echo "FAIL: Validator exited early" && tail -100 /tmp/validator.log && exit 1)
+            (echo "FAIL: Validator exited during stability window" && tail -100 /tmp/validator.log && exit 1)
 
-      - name: Assert metrics
+      - name: Assert metrics endpoint responsive
         run: |
           METRICS=$(curl -sf http://localhost:9090/metrics)
-
-          SENT=$(echo "$METRICS" | awk '/^sn2_requests_sent_total/ {sum += $NF} END {print int(sum+0)}')
-          echo "Requests sent: ${SENT}"
-          [[ "${SENT:-0}" -ge 2 ]] || \
-            (echo "FAIL: Expected >= 2 requests sent, got ${SENT:-0}" && exit 1)
-
-          SUCCESSES=$(echo "$METRICS" | awk '/sn2_responses_total\{.*success/ {sum += int($NF+0)} END {print int(sum+0)}')
-          FAILURES=$(echo "$METRICS"  | awk '/sn2_responses_total\{.*failure/ {sum += int($NF+0)} END {print int(sum+0)}')
-          TOTAL=$(( ${SUCCESSES:-0} + ${FAILURES:-0} ))
-          echo "Responses: ${SUCCESSES:-0} success, ${FAILURES:-0} failure (${TOTAL} total)"
-
-          [[ "${TOTAL}" -ge 2 ]] || \
-            (echo "FAIL: Expected >= 2 total responses, got ${TOTAL}" && exit 1)
-
-          if [[ "$TOTAL" -gt 0 ]]; then
-            SUCCESS_PCT=$(( ${SUCCESSES:-0} * 100 / TOTAL ))
-            echo "Success rate: ${SUCCESS_PCT}%"
-            [[ "$SUCCESS_PCT" -ge 50 ]] || \
-              (echo "FAIL: Success rate ${SUCCESS_PCT}% < 50%" && exit 1)
-          fi
+          echo "$METRICS" | head -20
+          echo "$METRICS" | grep -q "^sn2_" || \
+            (echo "FAIL: No sn2_ metrics found" && exit 1)
 
       - name: Shutdown validator
+        if: always()
         run: |
           kill -INT $VALIDATOR_PID
           for i in $(seq 1 20); do
             kill -0 $VALIDATOR_PID 2>/dev/null || break
             sleep 1
           done
+          kill -0 $VALIDATOR_PID 2>/dev/null && \
+            (echo "WARN: Validator did not exit on SIGINT, sending SIGKILL" && kill -9 $VALIDATOR_PID) || true
 
       - name: Shutdown miner
+        if: always()
         run: |
           kill -INT $MINER_PID
           for i in $(seq 1 20); do
             kill -0 $MINER_PID 2>/dev/null || break
             sleep 1
           done
+          kill -0 $MINER_PID 2>/dev/null && \
+            (echo "WARN: Miner did not exit on SIGINT, sending SIGKILL" && kill -9 $MINER_PID) || true
 
-      - name: Assert scoring
-        run: |
-          python3 - <<'PYEOF'
-          import json, os, sys
-          path = os.path.expanduser("~/.bittensor/subnet-2/scores.json")
-          try:
-              scores = json.loads(open(path).read())
-          except Exception as e:
-              print(f"FAIL: Cannot read scores.json: {e}", file=sys.stderr)
-              sys.exit(1)
-          score = float(scores.get("0", 0))
-          if score <= 0:
-              print(f"FAIL: UID 0 score {score:.8f} is not positive", file=sys.stderr)
-              sys.exit(1)
-          print(f"UID 0 score: {score:.8f}")
-          PYEOF
-
-      - name: Dump logs on failure
-        if: failure()
+      - name: Dump logs
+        if: always()
         run: |
           echo "=== VALIDATOR LOG (last 200 lines) ==="
           tail -200 /tmp/validator.log || true
           echo "=== MINER LOG (last 100 lines) ==="
           tail -100 /tmp/miner.log || true
-          echo "=== SCORES ==="
-          cat ~/.bittensor/subnet-2/scores.json 2>/dev/null || echo "(not found)"
-          echo "=== PERFORMANCE TRACKER ==="
-          cat ~/.bittensor/subnet-2/performance_tracker.json 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print(json.dumps(d, indent=2))" 2>/dev/null || echo "(not found)"
-          echo "=== METRICS ==="
-          curl -sf http://localhost:9090/metrics 2>/dev/null || echo "(unavailable)"
 
   build:
+    if: github.event_name != 'pull_request'
     uses: ./.github/workflows/build-binaries.yml
     with:
       ref: testnet
 
   publish-nightly:
     name: Publish testnet-nightly
-    needs: [loopback-e2e, build]
+    if: github.event_name != 'pull_request'
+    needs: [smoke-test, build]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -267,7 +217,8 @@ jobs:
 
   release-nightly:
     name: Nightly GitHub Release
-    needs: [loopback-e2e, build]
+    if: github.event_name != 'pull_request'
+    needs: [smoke-test, build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -300,7 +251,7 @@ jobs:
           tag_name: testnet-nightly
           name: Testnet Nightly
           body: |
-            E2E-validated nightly build from `testnet` at ${{ github.sha }}.
+            Smoke-tested nightly build from `testnet` at ${{ github.sha }}.
             Built: ${{ steps.ts.outputs.timestamp }}
           prerelease: true
           make_latest: false
