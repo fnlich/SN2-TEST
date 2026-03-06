@@ -43,50 +43,54 @@ pub async fn verify_inner(
     let proof_hex = proof_hex.to_string();
     let expected_inputs = expected_inputs.clone();
 
-    tokio::task::spawn_blocking(move || -> Result<VerifyResult> {
-        let circuit_bytes = {
-            let mut cache = CIRCUIT_CACHE.lock().unwrap();
-            if let Some(cached) = cache.get(&circuit_path) {
-                Arc::clone(cached)
-            } else {
-                let bytes = if std::path::Path::new(&circuit_path).is_dir() {
-                    let bundle = read_circuit_msgpack(&circuit_path)
-                        .map_err(|e| anyhow::anyhow!("reading bundle {circuit_path}: {e}"))?;
-                    bundle.circuit
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let result = (|| -> Result<VerifyResult> {
+            let circuit_bytes = {
+                let mut cache = CIRCUIT_CACHE.lock().unwrap();
+                if let Some(cached) = cache.get(&circuit_path) {
+                    Arc::clone(cached)
                 } else {
-                    std::fs::read(&circuit_path)
-                        .with_context(|| format!("reading {circuit_path}"))?
-                };
-                info!(path = %circuit_path, size_mb = bytes.len() as f64 / (1024.0 * 1024.0), "cached circuit bytes");
-                let arc = Arc::new(bytes);
-                cache.insert(circuit_path.clone(), Arc::clone(&arc));
-                arc
+                    let bytes = if std::path::Path::new(&circuit_path).is_dir() {
+                        let bundle = read_circuit_msgpack(&circuit_path)
+                            .map_err(|e| anyhow::anyhow!("reading bundle {circuit_path}: {e}"))?;
+                        bundle.circuit
+                    } else {
+                        std::fs::read(&circuit_path)
+                            .with_context(|| format!("reading {circuit_path}"))?
+                    };
+                    info!(path = %circuit_path, size_mb = bytes.len() as f64 / (1024.0 * 1024.0), "cached circuit bytes");
+                    let arc = Arc::new(bytes);
+                    cache.insert(circuit_path.clone(), Arc::clone(&arc));
+                    arc
+                }
+            };
+            let witness_bytes =
+                hex::decode(witness_hex.trim()).context("hex-decoding witness")?;
+            let proof_bytes = hex::decode(proof_hex.trim()).context("hex-decoding proof")?;
+
+            let result = verify_and_extract_bn254(
+                &circuit_bytes,
+                &witness_bytes,
+                &proof_bytes,
+                num_inputs,
+                expected_inputs.as_deref(),
+            )
+            .map_err(|e| anyhow::anyhow!("verification: {e}"))?;
+
+            if !result.valid {
+                anyhow::bail!("proof verification failed");
             }
-        };
-        let witness_bytes = hex::decode(witness_hex.trim()).context("hex-decoding witness")?;
-        let proof_bytes = hex::decode(proof_hex.trim()).context("hex-decoding proof")?;
 
-        let result = verify_and_extract_bn254(
-            &circuit_bytes,
-            &witness_bytes,
-            &proof_bytes,
-            num_inputs,
-            expected_inputs.as_deref(),
-        )
-        .map_err(|e| anyhow::anyhow!("verification: {e}"))?;
-
-        if !result.valid {
-            anyhow::bail!("proof verification failed");
-        }
-
-        Ok(VerifyResult {
-            rescaled_outputs: result.outputs,
-            scale_base: result.scale_base,
-            scale_exponent: result.scale_exponent,
-        })
-    })
-    .await
-    .context("blocking task panicked")?
+            Ok(VerifyResult {
+                rescaled_outputs: result.outputs,
+                scale_base: result.scale_base,
+                scale_exponent: result.scale_exponent,
+            })
+        })();
+        let _ = tx.send(result);
+    });
+    rx.await.context("verification thread panicked")?
 }
 
 pub async fn handle_request(req: VerifyRequest) -> VerifyResponse {
