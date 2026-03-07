@@ -61,13 +61,11 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
           key: linux-registry-${{ hashFiles('Cargo.lock') }}-${{ matrix.arch }}
-          restore-keys: |
-            linux-registry-${{ hashFiles('Cargo.lock') }}-
-            linux-registry-
 
       - name: Build release binaries
         run: cargo build --release --locked --bin sn2-validator --bin sn2-miner
         env:
+          SCCACHE_GHA_VERSION: ${{ hashFiles('Cargo.lock') }}
           PYO3_PYTHON: python3
           SN2_RELEASE_CHANNEL: ${{ inputs.release-channel }}
           SN2_VERSION: ${{ inputs.version }}
@@ -129,11 +127,11 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
           key: macos-aarch64-registry-${{ hashFiles('Cargo.lock') }}
-          restore-keys: macos-aarch64-registry-
 
       - name: Build release binaries
         run: cargo build --release --locked --bin sn2-validator --bin sn2-miner
         env:
+          SCCACHE_GHA_VERSION: ${{ hashFiles('Cargo.lock') }}
           PYO3_PYTHON: ${{ steps.setup-python.outputs.python-path }}
           SN2_RELEASE_CHANNEL: ${{ inputs.release-channel }}
           SN2_VERSION: ${{ inputs.version }}
