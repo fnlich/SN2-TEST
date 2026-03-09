@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
+use sha2::{Digest, Sha256};
 use sn2_types::{
     Circuit, CircuitMetadata, CircuitPaths, CircuitType, ProofSystem, CIRCUIT_API_URL,
     CIRCUIT_CACHE_DIR, CIRCUIT_TIMEOUT_SECONDS, IGNORED_MODEL_HASHES,
@@ -70,6 +71,7 @@ impl CircuitStore {
         let mut active_ids: HashSet<String> = api_circuits
             .iter()
             .filter_map(|c| c.get("id").and_then(|v| v.as_str()).map(String::from))
+            .filter(|id| !IGNORED_MODEL_HASHES.contains(&id.as_str()))
             .collect();
 
         for pinned_id in &self.pinned_ids {
@@ -144,6 +146,10 @@ impl CircuitStore {
             anyhow::bail!("circuit {} is in the ignored list", circuit_id);
         }
 
+        if self.is_downloading(circuit_id) {
+            anyhow::bail!("circuit {} has incomplete file downloads", circuit_id);
+        }
+
         if let Some(circuit) = self.circuits.get(circuit_id) {
             return Ok(circuit.clone());
         }
@@ -173,11 +179,15 @@ impl CircuitStore {
         let active_ids: HashSet<String> = api_circuits
             .iter()
             .filter_map(|c| c.get("id").and_then(|v| v.as_str()).map(String::from))
+            .filter(|id| !IGNORED_MODEL_HASHES.contains(&id.as_str()))
             .collect();
 
         for circuit_data in &api_circuits {
             if let Some(id) = circuit_data.get("id").and_then(|v| v.as_str()) {
-                if self.circuits.contains_key(id) || IGNORED_MODEL_HASHES.contains(&id) {
+                if IGNORED_MODEL_HASHES.contains(&id) {
+                    continue;
+                }
+                if self.circuits.contains_key(id) && !self.is_downloading(id) {
                     continue;
                 }
                 match self.cache_and_load_circuit(id, circuit_data).await {
@@ -236,6 +246,10 @@ impl CircuitStore {
 
     pub fn circuit_count(&self) -> usize {
         self.circuits.len()
+    }
+
+    pub fn is_downloading(&self, circuit_id: &str) -> bool {
+        self.inflight_downloads.lock().unwrap().contains(circuit_id)
     }
 
     pub fn cache_dir(&self) -> &Path {
@@ -342,41 +356,43 @@ impl CircuitStore {
             }
 
             if !deferred_downloads.is_empty() {
-                let already_inflight = {
-                    let mut guard = self.inflight_downloads.lock().unwrap();
-                    !guard.insert(circuit_id.to_string())
-                };
-                if already_inflight {
-                    info!(circuit = %circuit_id, "skipping duplicate background dslice download");
-                } else {
-                    let count = deferred_downloads.len();
-                    let http = self.http.clone();
-                    let inflight = Arc::clone(&self.inflight_downloads);
-                    let cid = circuit_id.to_string();
-                    info!(circuit = %circuit_id, files = count, "spawning background dslice downloads");
-                    tokio::spawn(async move {
-                        let mut downloaded = 0usize;
-                        for (url, dest) in &deferred_downloads {
-                            if dest.exists() {
+                self.inflight_downloads
+                    .lock()
+                    .unwrap()
+                    .insert(circuit_id.to_string());
+                let count = deferred_downloads.len();
+                let http = self.http.clone();
+                let inflight = Arc::clone(&self.inflight_downloads);
+                let cid = circuit_id.to_string();
+                info!(circuit = %circuit_id, files = count, "spawning background dslice downloads");
+                tokio::spawn(async move {
+                    let mut downloaded = 0usize;
+                    let mut failed = 0usize;
+                    for (url, dest) in &deferred_downloads {
+                        if dest.exists() {
+                            downloaded += 1;
+                            continue;
+                        }
+                        match download_file_static(&http, url, dest).await {
+                            Ok(()) => {
                                 downloaded += 1;
-                                continue;
+                                if downloaded % 20 == 0 || downloaded == count {
+                                    info!(progress = %format!("{downloaded}/{count}"), "dslice download progress");
+                                }
                             }
-                            match download_file_static(&http, url, dest).await {
-                                Ok(()) => {
-                                    downloaded += 1;
-                                    if downloaded % 20 == 0 || downloaded == count {
-                                        info!(progress = %format!("{downloaded}/{count}"), "dslice download progress");
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(file = %dest.display(), error = %e, "failed to download dslice file");
-                                }
+                            Err(e) => {
+                                failed += 1;
+                                warn!(file = %dest.display(), error = %e, "failed to download dslice file");
                             }
                         }
+                    }
+                    if failed == 0 {
                         inflight.lock().unwrap().remove(&cid);
-                        info!(count = downloaded, "dslice background downloads complete");
-                    });
-                }
+                    } else {
+                        warn!(circuit = %cid, failed, "dslice downloads incomplete, circuit stays unavailable until next refresh");
+                    }
+                    info!(count = downloaded, "dslice background downloads complete");
+                });
             }
         }
 
@@ -459,6 +475,12 @@ async fn download_file_static(http: &reqwest::Client, url: &str, dest: &Path) ->
         anyhow::bail!("download returned {}", resp.status());
     }
 
+    let expected_sha256 = resp
+        .headers()
+        .get("x-checksum-sha256")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_lowercase());
+
     let partial = dest.with_extension("partial");
 
     let result = async {
@@ -476,6 +498,7 @@ async fn download_file_static(http: &reqwest::Client, url: &str, dest: &Path) ->
         let mut writer = tokio::io::BufWriter::new(file);
         let mut stream = resp.bytes_stream();
         let mut downloaded: u64 = 0;
+        let mut hasher = Sha256::new();
 
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.context("reading download stream")?;
@@ -484,6 +507,7 @@ async fn download_file_static(http: &reqwest::Client, url: &str, dest: &Path) ->
                 downloaded <= max_bytes,
                 "download exceeded max size: {downloaded} > {max_bytes} bytes"
             );
+            hasher.update(&chunk);
             writer
                 .write_all(&chunk)
                 .await
@@ -494,6 +518,14 @@ async fn download_file_static(http: &reqwest::Client, url: &str, dest: &Path) ->
             .flush()
             .await
             .with_context(|| format!("flushing {}", partial.display()))?;
+
+        if let Some(expected) = &expected_sha256 {
+            let actual = hex::encode(hasher.finalize());
+            anyhow::ensure!(
+                &actual == expected,
+                "SHA-256 mismatch: expected {expected}, got {actual}"
+            );
+        }
 
         tokio::fs::rename(&partial, dest)
             .await
