@@ -114,6 +114,7 @@ pub struct ValidatorLoop {
     verify_tasks: JoinSet<VerifyResult>,
     verify_guard_hashes: HashMap<tokio::task::Id, Option<String>>,
     pending_verifications: VecDeque<TaskResult>,
+    verification_concurrency: usize,
 }
 
 impl ValidatorLoop {
@@ -205,6 +206,18 @@ impl ValidatorLoop {
             )
         };
 
+        let verification_concurrency = match std::thread::available_parallelism() {
+            Ok(n) => n.get(),
+            Err(e) => {
+                warn!(error = %e, fallback = 8, "CPU detection failed, using fallback verification concurrency");
+                8
+            }
+        };
+        info!(
+            verification_concurrency,
+            "initialized verification concurrency"
+        );
+
         let pipeline = RequestPipeline::new();
         let circuit_store_loopback = config.loopback && config.circuit_api_url.is_none();
         let circuit_store = CircuitStore::new(
@@ -257,6 +270,7 @@ impl ValidatorLoop {
             verify_tasks: JoinSet::new(),
             verify_guard_hashes: HashMap::new(),
             pending_verifications: VecDeque::new(),
+            verification_concurrency,
         })
     }
 
@@ -338,6 +352,7 @@ impl ValidatorLoop {
                         }
                     }
                     self.drain_pending_verifications();
+                    self.dispatch_notify.notify_one();
                 }
                 Some(submission) = self.dsperse_rx.recv() => {
                     self.handle_dsperse_submission(submission).await;
@@ -924,15 +939,17 @@ impl ValidatorLoop {
 
     async fn dispatch_requests(&mut self) -> Result<()> {
         let verification_backlog = self.verify_tasks.len() + self.pending_verifications.len();
-        if verification_backlog >= self.config.max_concurrent_verifications {
+        if verification_backlog >= self.verification_concurrency {
             return Ok(());
         }
 
         let active_count = self.tasks.len();
-        let available_slots = self.config.max_concurrency.saturating_sub(active_count);
-        if available_slots == 0 {
+        let total_pipeline = active_count + verification_backlog;
+        let dispatch_ceiling = self.verification_concurrency.saturating_mul(2);
+        if total_pipeline >= dispatch_ceiling {
             return Ok(());
         }
+        let mut dispatch_budget = dispatch_ceiling - total_pipeline;
 
         metrics::set_active_tasks(active_count);
 
@@ -957,25 +974,19 @@ impl ValidatorLoop {
             None
         };
 
-        let mut dispatched = 0usize;
-
         for neuron in &neurons {
-            if dispatched >= available_slots {
+            if dispatch_budget == 0 {
                 break;
             }
-
             let uid = neuron.uid;
             let cap = capacities.get(&uid).copied().unwrap_or(1);
             let active_now = self.miner_active_count.get(&uid).copied().unwrap_or(0);
             if active_now >= cap {
                 continue;
             }
-            let slots_for_miner = (cap - active_now).min(available_slots - dispatched);
+            let slots_for_miner = (cap - active_now).min(dispatch_budget);
 
             for _slot in 0..slots_for_miner {
-                if dispatched >= available_slots {
-                    break;
-                }
                 let active = self.miner_active_count.get(&uid).copied().unwrap_or(0);
                 let was_at_capacity = active + 1 >= cap;
 
@@ -1322,8 +1333,8 @@ impl ValidatorLoop {
                 if is_benchmark {
                     self.benchmark_in_flight += 1;
                 }
-                dispatched += 1;
                 metrics::record_request_sent(&request_type.to_string());
+                dispatch_budget = dispatch_budget.saturating_sub(1);
             } // end inner slot loop
         }
 
@@ -1386,7 +1397,7 @@ impl ValidatorLoop {
             self.benchmark_in_flight = self.benchmark_in_flight.saturating_sub(1);
         }
 
-        if self.verify_tasks.len() >= self.config.max_concurrent_verifications {
+        if self.verify_tasks.len() >= self.verification_concurrency {
             self.pending_verifications.push_back(result);
             return;
         }
@@ -1395,7 +1406,7 @@ impl ValidatorLoop {
     }
 
     fn drain_pending_verifications(&mut self) {
-        while self.verify_tasks.len() < self.config.max_concurrent_verifications {
+        while self.verify_tasks.len() < self.verification_concurrency {
             match self.pending_verifications.pop_front() {
                 Some(result) => self.spawn_verification(result),
                 None => break,
@@ -2200,8 +2211,9 @@ impl ValidatorLoop {
                 queryable_neurons = queryable_count,
                 benchmark_circuits = benchmark_count,
                 dsperse_circuits = dsperse_count,
-                max_concurrency = self.config.max_concurrency,
-                max_concurrent_verifications = self.config.max_concurrent_verifications,
+                verification_concurrency = self.verification_concurrency,
+                verify_tasks = self.verify_tasks.len(),
+                pending_verifications = self.pending_verifications.len(),
                 benchmark_in_flight = self.benchmark_in_flight,
                 "health"
             );
