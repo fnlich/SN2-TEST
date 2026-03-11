@@ -24,9 +24,6 @@ pub struct Cli {
     #[arg(long, alias = "logging.level", default_value = "info")]
     pub log_level: String,
 
-    #[arg(long, default_value_t = sn2_types::MAX_CONCURRENT_REQUESTS)]
-    pub max_concurrency: usize,
-
     #[arg(long, default_value_t = 20)]
     pub api_miners_pct: u32,
 
@@ -73,9 +70,6 @@ pub struct Cli {
         help = "Miner address (ip:port) for loopback mode"
     )]
     pub miner_address: String,
-
-    #[arg(long, default_value_t = sn2_types::MAX_CONCURRENT_VERIFICATIONS, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..))]
-    pub max_concurrent_verifications: usize,
 
     #[arg(long, value_delimiter = ',')]
     pub additional_circuits: Vec<String>,
