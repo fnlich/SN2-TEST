@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use crate::tensor_json::{arrayd_to_json, json_to_arrayd};
+use crate::tensor_json::arrayd_to_json;
 use dsperse::pipeline::{IncrementalRun, SliceExecutionResult, SliceWork};
 use dsperse::schema::execution::{ExecutionInfo, ExecutionMethod};
 use dsperse::schema::tiling::TilingInfo;
@@ -281,11 +281,11 @@ impl IncrementalRunManager {
         }
     }
 
-    pub fn apply_result(
+    pub fn apply_result_tensor(
         &mut self,
         run_uid: &str,
         slice_id: &str,
-        computed_outputs: &serde_json::Value,
+        output_tensor: ndarray::ArrayD<f64>,
     ) -> anyhow::Result<bool> {
         let run = self
             .runs
@@ -296,9 +296,6 @@ impl IncrementalRunManager {
             .incremental
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("run {run_uid} has no IncrementalRun"))?;
-
-        let output_tensor = json_to_arrayd(computed_outputs)
-            .map_err(|e| anyhow::anyhow!("output tensor conversion: {e}"))?;
 
         inc.apply_result(SliceExecutionResult {
             slice_id: slice_id.to_string(),

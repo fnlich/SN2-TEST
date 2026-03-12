@@ -153,6 +153,7 @@ pub struct ValidatorLoop {
     verify_guard_hashes: HashMap<tokio::task::Id, Option<String>>,
     pending_verifications: VecDeque<TaskResult>,
     verification_concurrency: usize,
+    dslice_input_scales: HashMap<(String, String), f64>,
 }
 
 impl ValidatorLoop {
@@ -308,6 +309,7 @@ impl ValidatorLoop {
             verify_guard_hashes: HashMap::new(),
             pending_verifications: VecDeque::new(),
             verification_concurrency,
+            dslice_input_scales: HashMap::new(),
         })
     }
 
@@ -589,7 +591,7 @@ impl ValidatorLoop {
     async fn enqueue_next_dslice(&mut self, run_uid: &str, circuit: &Circuit) {
         let slices_dir = circuit.paths.base_path.join("slices");
         loop {
-            let slice_info = match self.run_manager.next_slice(run_uid) {
+            let mut slice_info = match self.run_manager.next_slice(run_uid) {
                 Ok(Some(info)) => info,
                 Ok(None) => {
                     warn!(run_uid = %run_uid, "no next slice available");
@@ -632,6 +634,25 @@ impl ValidatorLoop {
                         return;
                     }
                 };
+                for (name, arr) in &slice_info.named_inputs {
+                    let nan_c = arr.iter().filter(|v| v.is_nan()).count();
+                    let inf_c = arr.iter().filter(|v| v.is_infinite()).count();
+                    let max_abs = arr.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+                    let f32_overflow = arr.iter().filter(|&&v| v.abs() > f32::MAX as f64).count();
+                    let elems = arr.len();
+                    info!(
+                        run_uid = %run_uid,
+                        slice = %slice_info.slice_id,
+                        input_name = %name,
+                        shape = ?arr.shape(),
+                        elems = elems,
+                        nan = nan_c,
+                        inf = inf_c,
+                        max_abs = max_abs,
+                        f32_overflow = f32_overflow,
+                        "ONNX slice input tensor stats"
+                    );
+                }
                 let inference_result = if slice_info.named_inputs.len() > 1 {
                     let inputs: Vec<(String, Vec<f64>, Vec<usize>)> = slice_info
                         .named_inputs
@@ -699,16 +720,32 @@ impl ValidatorLoop {
                         return;
                     }
                 };
-                info!(
-                    run_uid = %run_uid,
-                    slice = %slice_info.slice_id,
-                    output_shape = ?output_shape,
-                    "ran ONNX inference for non-circuit slice"
-                );
-                match self.run_manager.apply_result(
+                let nan_count = output_tensor.iter().filter(|v| v.is_nan()).count();
+                let inf_count = output_tensor.iter().filter(|v| v.is_infinite()).count();
+                let total_elems = output_tensor.len();
+                if nan_count > 0 || inf_count > 0 {
+                    warn!(
+                        run_uid = %run_uid,
+                        slice = %slice_info.slice_id,
+                        output_shape = ?output_shape,
+                        nan_count = nan_count,
+                        inf_count = inf_count,
+                        total_elems = total_elems,
+                        "ONNX output contains non-finite values"
+                    );
+                } else {
+                    info!(
+                        run_uid = %run_uid,
+                        slice = %slice_info.slice_id,
+                        output_shape = ?output_shape,
+                        total_elems = total_elems,
+                        "ran ONNX inference for non-circuit slice"
+                    );
+                }
+                match self.run_manager.apply_result_tensor(
                     run_uid,
                     &slice_info.slice_id,
-                    &crate::tensor_json::arrayd_to_json(&output_tensor),
+                    output_tensor,
                 ) {
                     Ok(true) => {
                         sn2_circuit_store::cleanup_extracted_slice(
@@ -766,6 +803,37 @@ impl ValidatorLoop {
                 .run_manager
                 .get_run_source(run_uid)
                 .unwrap_or(RunSource::Benchmark);
+
+            if slice_info.input_tensor.iter().any(|v| !v.is_finite()) {
+                warn!(
+                    run_uid = %run_uid,
+                    slice = %slice_info.slice_id,
+                    "circuit slice input contains non-finite values, aborting run"
+                );
+                self.teardown_run(run_uid).await;
+                return;
+            }
+
+            let input_max_abs = slice_info
+                .input_tensor
+                .iter()
+                .fold(0.0_f64, |m, v| m.max(v.abs()));
+            if input_max_abs > 1.0 {
+                slice_info.input_tensor.mapv_inplace(|v| v / input_max_abs);
+                slice_info.inputs_json = serde_json::json!({
+                    "input_data": crate::tensor_json::arrayd_to_json(&slice_info.input_tensor)
+                });
+                self.dslice_input_scales.insert(
+                    (run_uid.to_string(), slice_info.slice_id.clone()),
+                    input_max_abs,
+                );
+                info!(
+                    run_uid = %run_uid,
+                    slice = %slice_info.slice_id,
+                    input_max_abs,
+                    "normalized circuit slice inputs to [-1, 1]"
+                );
+            }
 
             if let Some(ref tiling) = slice_info.tiling {
                 let input_4d = match slice_info
@@ -1772,9 +1840,18 @@ impl ValidatorLoop {
                 .buffer_tile_result(&run_uid, &slice_num, tile_idx, tile_output)
             {
                 TileBufferOutcome::Waiting => return,
-                TileBufferOutcome::Ready(full_output) => {
-                    let full_json = crate::tensor_json::arrayd_to_json(&full_output);
-                    self.apply_dslice_result(&run_uid, &slice_num, &full_json)
+                TileBufferOutcome::Ready(mut full_output) => {
+                    let scale_key = (run_uid.clone(), slice_num.clone());
+                    if let Some(scale) = self.dslice_input_scales.remove(&scale_key) {
+                        full_output.mapv_inplace(|v| v * scale);
+                        info!(
+                            run_uid = %run_uid,
+                            slice = %slice_num,
+                            scale,
+                            "denormalized tiled circuit output"
+                        );
+                    }
+                    self.apply_dslice_result_tensor(&run_uid, &slice_num, full_output)
                         .await;
                 }
                 TileBufferOutcome::Failed(reason) => {
@@ -1796,15 +1873,37 @@ impl ValidatorLoop {
             .cloned()
             .unwrap_or(serde_json::Value::Null);
 
-        self.apply_dslice_result(&run_uid, &slice_num, &computed)
+        let scale_key = (run_uid.clone(), slice_num.clone());
+        let scale = self.dslice_input_scales.remove(&scale_key);
+
+        let mut tensor = match crate::tensor_json::json_to_arrayd(&computed) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(run_uid = %run_uid, slice = %slice_num, error = %e, "output tensor conversion failed, removing run");
+                self.teardown_run(&run_uid).await;
+                return;
+            }
+        };
+
+        if let Some(scale) = scale {
+            tensor.mapv_inplace(|v| v * scale);
+            info!(
+                run_uid = %run_uid,
+                slice = %slice_num,
+                scale,
+                "denormalized circuit output"
+            );
+        }
+
+        self.apply_dslice_result_tensor(&run_uid, &slice_num, tensor)
             .await;
     }
 
-    async fn apply_dslice_result(
+    async fn apply_dslice_result_tensor(
         &mut self,
         run_uid: &str,
         slice_num: &str,
-        computed: &serde_json::Value,
+        output: ndarray::ArrayD<f64>,
     ) {
         let slices_dir = self
             .run_manager
@@ -1817,7 +1916,10 @@ impl ValidatorLoop {
             sn2_circuit_store::cleanup_extracted_slice(sd, slice_num);
         }
 
-        match self.run_manager.apply_result(run_uid, slice_num, computed) {
+        match self
+            .run_manager
+            .apply_result_tensor(run_uid, slice_num, output)
+        {
             Ok(is_complete) => {
                 if is_complete {
                     info!(run_uid = %run_uid, "incremental run complete");
@@ -1999,6 +2101,8 @@ impl ValidatorLoop {
         self.stacked_dslice_queue
             .retain(|req| req.run_uid != run_uid);
         self.api_dslice_queue.retain(|req| req.run_uid != run_uid);
+        self.dslice_input_scales
+            .retain(|(uid, _), _| uid != run_uid);
         self.relay_remove_pending(run_uid).await;
     }
 
@@ -2158,6 +2262,7 @@ impl ValidatorLoop {
                         if !evicted.is_empty() {
                             info!(circuit = %circuit_id, runs = ?evicted, "evicted in-flight runs for deactivated circuit");
                             for run_id in &evicted {
+                                self.dslice_input_scales.retain(|(uid, _), _| uid != run_id);
                                 self.relay_remove_pending(run_id).await;
                             }
                         }
@@ -2195,6 +2300,8 @@ impl ValidatorLoop {
         if now.duration_since(self.timings.gc) > Duration::from_secs(120) {
             let evicted = self.run_manager.gc_stale(Duration::from_secs(600));
             for uid in &evicted {
+                self.dslice_input_scales
+                    .retain(|(run_uid, _), _| run_uid != uid);
                 self.relay_remove_pending(uid).await;
             }
             if !evicted.is_empty() {
