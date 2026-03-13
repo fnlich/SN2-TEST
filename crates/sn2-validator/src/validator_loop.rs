@@ -929,6 +929,61 @@ impl ValidatorLoop {
                 };
 
                 let num_tiles = tiles.len();
+
+                if run_source == RunSource::Api {
+                    if tiles.is_empty() {
+                        let slice_path = slices_dir.join(&slice_info.slice_id);
+                        sn2_verify::evict_circuit_cache(&slice_path.to_string_lossy());
+                        sn2_circuit_store::cleanup_extracted_slice(
+                            &slices_dir,
+                            &slice_info.slice_id,
+                        );
+                        warn!(
+                            run_uid = %run_uid,
+                            slice = %slice_info.slice_id,
+                            "split_into_tiles returned no tiles for API run"
+                        );
+                        self.teardown_run(run_uid).await;
+                        return;
+                    }
+                    info!(
+                        run_uid = %run_uid,
+                        slice = %slice_info.slice_id,
+                        num_tiles,
+                        "API request: dispatching single tile for proven inference"
+                    );
+                    let tile = &tiles[0];
+                    let tile_json = serde_json::json!({
+                        "input_data": crate::tensor::arrayd_to_json(&tile.clone().into_dyn())
+                    });
+                    let request = DSliceRequest {
+                        circuit: circuit.clone(),
+                        inputs: tile_json,
+                        request_type: RequestType::DSlice,
+                        proof_system: circuit.proof_system,
+                        slice_num: slice_info.slice_id.clone(),
+                        run_uid: run_uid.to_string(),
+                        outputs: None,
+                        is_tile: false,
+                        tile_idx: None,
+                        task_id: None,
+                        run_source,
+                        retry_count: 0,
+                        circuit_path: slice_info.circuit_path.clone(),
+                    };
+                    self.api_dslice_queue.push_back(request);
+
+                    {
+                        let uid = run_uid.to_string();
+                        let snum = slice_info.slice_id.clone();
+                        self.emit_event(move |ev| async move {
+                            ev.emit_work_items_created(&uid, &snum, 1).await;
+                        });
+                    }
+
+                    return;
+                }
+
                 info!(
                     run_uid = %run_uid,
                     slice = %slice_info.slice_id,
@@ -969,10 +1024,7 @@ impl ValidatorLoop {
                         retry_count: 0,
                         circuit_path: slice_info.circuit_path.clone(),
                     };
-                    match run_source {
-                        RunSource::Api => self.api_dslice_queue.push_back(request),
-                        RunSource::Benchmark => self.stacked_dslice_queue.push_back(request),
-                    };
+                    self.stacked_dslice_queue.push_back(request);
                 }
 
                 {
@@ -1869,6 +1921,86 @@ impl ValidatorLoop {
                 verification_time,
             },
         );
+
+        if self.run_manager.get_run_source(&run_uid) == Some(RunSource::Api) {
+            self.dslice_input_scales
+                .retain(|(uid, _), _| uid != &run_uid);
+
+            let slices_dir = self
+                .run_manager
+                .get_circuit_id(&run_uid)
+                .and_then(|cid| self.circuit_store.get_circuit(cid))
+                .map(|c| c.paths.base_path.join("slices"));
+            if let Some(ref sd) = slices_dir {
+                let slice_path = sd.join(&slice_num);
+                sn2_verify::evict_circuit_cache(&slice_path.to_string_lossy());
+                sn2_circuit_store::cleanup_extracted_slice(sd, &slice_num);
+            }
+
+            info!(
+                run_uid = %run_uid,
+                slice = %slice_num,
+                "API request: single proven tile complete, finalizing run"
+            );
+            let mut active_run = self.run_manager.remove_run(&run_uid);
+            if let Some(ref run) = active_run {
+                self.report_dsperse_completion(run);
+                self.spawn_emit_run_complete(run, true);
+            }
+            let artifacts = active_run
+                .as_mut()
+                .map(|r| std::mem::take(&mut r.artifacts))
+                .unwrap_or_default();
+            if !artifacts.is_empty() {
+                if let Some(uploader) = &self.proof_uploader {
+                    let uploader = Arc::clone(uploader);
+                    let uid_clone = run_uid.clone();
+                    let circuit_id = active_run
+                        .as_ref()
+                        .map(|r| r.circuit_id.clone())
+                        .unwrap_or_default();
+                    let circuit_name = active_run
+                        .as_ref()
+                        .map(|r| r.circuit_name.clone())
+                        .unwrap_or_default();
+                    self.upload_tasks.spawn(async move {
+                        if let Err(e) = uploader
+                            .upload_run_artifacts(
+                                &uid_clone,
+                                &circuit_id,
+                                &circuit_name,
+                                artifacts,
+                                None,
+                            )
+                            .await
+                        {
+                            warn!(run_uid = %uid_clone, error = %e, "proof upload failed");
+                        }
+                    });
+                }
+            }
+            let notify_circuit_id = active_run
+                .as_ref()
+                .map(|r| r.circuit_id.as_str())
+                .unwrap_or_default()
+                .to_string();
+            self.relay_set_request_result(
+                &run_uid,
+                serde_json::json!({"run_uid": run_uid, "status": "complete"}),
+            )
+            .await;
+            self.relay_send_notification(
+                "subnet-2.batch_completed",
+                serde_json::json!({
+                    "run_uid": run_uid,
+                    "circuit_id": notify_circuit_id,
+                    "status": "completed",
+                }),
+            )
+            .await;
+            self.relay_remove_pending(&run_uid).await;
+            return;
+        }
 
         if is_tile {
             let tile_idx = match tile_idx {
