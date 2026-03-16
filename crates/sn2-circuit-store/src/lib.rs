@@ -14,6 +14,7 @@ use tracing::{info, warn};
 
 const SKIP_AUTO_DOWNLOAD: &[&str] = &["metadata.json", "full_model.onnx"];
 const CIRCUIT_METADATA_FILENAME: &str = "circuit_metadata.json";
+const DSLICE_READY_MARKER: &str = ".dslice_ready";
 const REFRESH_INTERVAL_SECS: u64 = 600;
 
 pub struct CircuitStore {
@@ -74,42 +75,14 @@ impl CircuitStore {
             .filter(|id| !IGNORED_MODEL_HASHES.contains(&id.as_str()))
             .collect();
 
-        for pinned_id in &self.pinned_ids {
-            if active_ids.contains(pinned_id) {
-                continue;
-            }
-            info!(id = %pinned_id, "fetching pinned circuit from API");
-            let url = format!("{}/circuits/{}", self.api_url, pinned_id);
-            match self.http.get(&url).send().await {
-                Ok(resp) if resp.status().is_success() => {
-                    match resp.json::<serde_json::Value>().await {
-                        Ok(data) => {
-                            active_ids.insert(pinned_id.clone());
-                            api_circuits.push(data);
-                        }
-                        Err(e) => {
-                            warn!(id = %pinned_id, error = %e, "failed to parse pinned circuit response");
-                        }
-                    }
-                }
-                Ok(resp) => {
-                    warn!(id = %pinned_id, status = %resp.status(), "failed to fetch pinned circuit");
-                }
-                Err(e) => {
-                    warn!(id = %pinned_id, error = %e, "failed to fetch pinned circuit");
-                }
-            }
-        }
+        self.fetch_pinned_circuits(&mut active_ids, &mut api_circuits)
+            .await;
 
-        if active_ids.is_empty() {
-            self.load_from_cache(&active_ids);
-        } else {
-            let mut load_ids = active_ids.clone();
-            for id in &self.pinned_ids {
-                load_ids.insert(id.clone());
-            }
-            self.load_from_cache(&load_ids);
+        let mut load_ids = active_ids.clone();
+        for id in &self.pinned_ids {
+            load_ids.insert(id.clone());
         }
+        self.load_from_cache(&load_ids);
 
         for circuit_data in &api_circuits {
             if let Some(id) = circuit_data.get("id").and_then(|v| v.as_str()) {
@@ -252,6 +225,11 @@ impl CircuitStore {
         self.inflight_downloads.lock().unwrap().contains(circuit_id)
     }
 
+    pub fn is_dsperse_ready(&self, circuit_id: &str) -> bool {
+        let cache_path = self.cache_dir.join(format!("model_{circuit_id}"));
+        cache_path.join(DSLICE_READY_MARKER).exists()
+    }
+
     pub fn cache_dir(&self) -> &Path {
         &self.cache_dir
     }
@@ -281,12 +259,46 @@ impl CircuitStore {
         Ok(circuits)
     }
 
+    async fn fetch_pinned_circuits(
+        &self,
+        active_ids: &mut HashSet<String>,
+        api_circuits: &mut Vec<serde_json::Value>,
+    ) {
+        for pinned_id in &self.pinned_ids {
+            if active_ids.contains(pinned_id) {
+                continue;
+            }
+            info!(id = %pinned_id, "fetching pinned circuit from API");
+            let url = format!("{}/circuits/{}", self.api_url, pinned_id);
+            match self.http.get(&url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    match resp.json::<serde_json::Value>().await {
+                        Ok(data) => {
+                            active_ids.insert(pinned_id.clone());
+                            api_circuits.push(data);
+                        }
+                        Err(e) => {
+                            warn!(id = %pinned_id, error = %e, "failed to parse pinned circuit response");
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    warn!(id = %pinned_id, status = %resp.status(), "failed to fetch pinned circuit");
+                }
+                Err(e) => {
+                    warn!(id = %pinned_id, error = %e, "failed to fetch pinned circuit");
+                }
+            }
+        }
+    }
+
     async fn cache_and_load_circuit(
         &self,
         circuit_id: &str,
         data: &serde_json::Value,
     ) -> Result<Circuit> {
         let cache_path = self.cache_dir.join(format!("model_{circuit_id}"));
+        let is_fresh = !cache_path.exists();
         std::fs::create_dir_all(&cache_path)
             .with_context(|| format!("creating cache dir {}", cache_path.display()))?;
 
@@ -297,13 +309,7 @@ impl CircuitStore {
         let metadata: CircuitMetadata =
             serde_json::from_value(metadata_value.clone()).context("parsing circuit metadata")?;
 
-        let metadata_path = cache_path.join(CIRCUIT_METADATA_FILENAME);
-        std::fs::write(
-            &metadata_path,
-            serde_json::to_string_pretty(metadata_value)?,
-        )
-        .context("writing metadata")?;
-
+        let metadata_json = serde_json::to_string_pretty(metadata_value)?;
         let is_dsperse = metadata.circuit_type == CircuitType::DSPERSE_PROOF_GENERATION;
 
         if let Some(files) = data.get("files").and_then(|v| v.as_object()) {
@@ -313,100 +319,34 @@ impl CircuitStore {
                     .with_context(|| format!("creating slices dir {}", slices_dir.display()))?;
             }
 
-            let mut deferred_downloads: Vec<(String, PathBuf)> = Vec::new();
             let checksums = data
                 .get("checksums")
                 .and_then(|v| v.as_object())
                 .cloned()
                 .unwrap_or_default();
 
-            for (filename, url_val) in files {
-                let skip = if is_dsperse {
-                    filename == "full_model.onnx"
-                } else {
-                    SKIP_AUTO_DOWNLOAD.contains(&filename.as_str())
-                };
-                if skip {
-                    continue;
-                }
-
-                if is_dsperse && filename.ends_with(".dslice") {
-                    let archive_dest = cache_path.join("slices").join(filename);
-                    let slice_name = filename.trim_end_matches(".dslice");
-                    let extracted_dir = cache_path.join("slices").join(slice_name);
-                    if archive_dest.exists() {
-                        if file_checksum_valid(&archive_dest, &checksums, filename) {
-                            continue;
-                        }
-                        warn!(file = %filename, "SHA-256 mismatch, removing corrupted dslice");
-                        std::fs::remove_file(&archive_dest).ok();
-                        std::fs::remove_dir_all(&extracted_dir).ok();
-                    } else if extracted_dir.exists() {
-                        continue;
+            let deferred_downloads = match self
+                .download_circuit_files(files, &cache_path, is_dsperse, &checksums)
+                .await
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    if is_fresh {
+                        let _ = std::fs::remove_dir_all(&cache_path);
                     }
-                    if let Some(url) = url_val.as_str() {
-                        deferred_downloads.push((url.to_string(), archive_dest));
-                    }
-                    continue;
+                    return Err(e);
                 }
-
-                let dest = if is_dsperse
-                    && (filename == "metadata.json" || filename == "metadata.msgpack")
-                {
-                    cache_path.join("slices").join(filename)
-                } else {
-                    cache_path.join(filename)
-                };
-                if dest.exists() {
-                    continue;
-                }
-                if let Some(url) = url_val.as_str() {
-                    if let Err(e) = self.download_file(url, &dest).await {
-                        warn!(file = %filename, error = %e, "failed to download circuit file");
-                    }
-                }
-            }
+            };
 
             if !deferred_downloads.is_empty() {
-                self.inflight_downloads
-                    .lock()
-                    .unwrap()
-                    .insert(circuit_id.to_string());
-                let count = deferred_downloads.len();
-                let http = self.http.clone();
-                let inflight = Arc::clone(&self.inflight_downloads);
-                let cid = circuit_id.to_string();
-                info!(circuit = %circuit_id, files = count, "spawning background dslice downloads");
-                tokio::spawn(async move {
-                    let mut downloaded = 0usize;
-                    let mut failed = 0usize;
-                    for (url, dest) in &deferred_downloads {
-                        if dest.exists() {
-                            downloaded += 1;
-                            continue;
-                        }
-                        match download_file_static(&http, url, dest).await {
-                            Ok(()) => {
-                                downloaded += 1;
-                                if downloaded % 20 == 0 || downloaded == count {
-                                    info!(progress = %format!("{downloaded}/{count}"), "dslice download progress");
-                                }
-                            }
-                            Err(e) => {
-                                failed += 1;
-                                warn!(file = %dest.display(), error = %e, "failed to download dslice file");
-                            }
-                        }
-                    }
-                    if failed == 0 {
-                        inflight.lock().unwrap().remove(&cid);
-                    } else {
-                        warn!(circuit = %cid, failed, "dslice downloads incomplete, circuit stays unavailable until next refresh");
-                    }
-                    info!(count = downloaded, "dslice background downloads complete");
-                });
+                self.spawn_deferred_downloads(circuit_id, &cache_path, deferred_downloads);
+            } else if is_dsperse {
+                let _ = std::fs::write(cache_path.join(DSLICE_READY_MARKER), b"");
             }
         }
+
+        let metadata_path = cache_path.join(CIRCUIT_METADATA_FILENAME);
+        std::fs::write(&metadata_path, metadata_json).context("writing metadata")?;
 
         let settings = load_settings(&cache_path);
         let proof_system = metadata
@@ -430,6 +370,134 @@ impl CircuitStore {
         })
     }
 
+    async fn download_circuit_files(
+        &self,
+        files: &serde_json::Map<String, serde_json::Value>,
+        cache_path: &Path,
+        is_dsperse: bool,
+        checksums: &serde_json::Map<String, serde_json::Value>,
+    ) -> Result<Vec<(String, PathBuf)>> {
+        let mut deferred_downloads: Vec<(String, PathBuf)> = Vec::new();
+
+        for (filename, url_val) in files {
+            let safe_name = Path::new(filename).file_name().and_then(|n| n.to_str());
+            if safe_name != Some(filename.as_str()) {
+                anyhow::bail!("rejecting filename with path traversal: {filename}");
+            }
+
+            let skip = if is_dsperse {
+                filename == "full_model.onnx"
+            } else {
+                SKIP_AUTO_DOWNLOAD.contains(&filename.as_str())
+            };
+            if skip {
+                continue;
+            }
+
+            if is_dsperse && filename.ends_with(".dslice") {
+                let cache_path = cache_path.to_path_buf();
+                let filename_owned = filename.clone();
+                let checksums = checksums.clone();
+                let url_val = url_val.clone();
+                match tokio::task::spawn_blocking(move || {
+                    resolve_dslice_download(&cache_path, &filename_owned, &checksums, &url_val)
+                })
+                .await
+                {
+                    Ok(Ok(Some(url))) => deferred_downloads.push(url),
+                    Ok(Ok(None)) => {}
+                    Ok(Err(e)) => {
+                        return Err(e.context(format!("dslice preflight failed: {filename}")));
+                    }
+                    Err(e) => {
+                        anyhow::bail!("spawn_blocking panicked for dslice check: {filename}: {e}");
+                    }
+                }
+                continue;
+            }
+
+            let dest =
+                if is_dsperse && (filename == "metadata.json" || filename == "metadata.msgpack") {
+                    cache_path.join("slices").join(filename)
+                } else {
+                    cache_path.join(filename)
+                };
+            if dest.exists() {
+                continue;
+            }
+            let url = url_val.as_str().with_context(|| {
+                format!("circuit file {filename} has non-string URL value: {url_val}")
+            })?;
+            self.download_file(url, &dest)
+                .await
+                .with_context(|| format!("downloading required circuit file: {filename}"))?;
+        }
+
+        Ok(deferred_downloads)
+    }
+
+    fn spawn_deferred_downloads(
+        &self,
+        circuit_id: &str,
+        cache_path: &Path,
+        deferred_downloads: Vec<(String, PathBuf)>,
+    ) {
+        if !self
+            .inflight_downloads
+            .lock()
+            .unwrap()
+            .insert(circuit_id.to_string())
+        {
+            return;
+        }
+        let _ = std::fs::remove_file(cache_path.join(DSLICE_READY_MARKER));
+        let count = deferred_downloads.len();
+        let http = self.http.clone();
+        let inflight = Arc::clone(&self.inflight_downloads);
+        let cid = circuit_id.to_string();
+        let marker_path = cache_path.join(DSLICE_READY_MARKER);
+        info!(circuit = %circuit_id, files = count, "spawning background dslice downloads");
+        tokio::spawn(async move {
+            let mut downloaded = 0usize;
+            let mut failed = 0usize;
+            for (url, dest) in &deferred_downloads {
+                if dest.exists() {
+                    downloaded += 1;
+                    continue;
+                }
+                match download_file_static(&http, url, dest).await {
+                    Ok(()) => {
+                        downloaded += 1;
+                        if downloaded % 20 == 0 || downloaded == count {
+                            info!(progress = %format!("{downloaded}/{count}"), "dslice download progress");
+                        }
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        warn!(file = %dest.display(), error = %e, "failed to download dslice file");
+                    }
+                }
+            }
+            if failed == 0 {
+                let _ = std::fs::write(&marker_path, b"");
+            } else {
+                warn!(circuit = %cid, failed, "dslice downloads incomplete, will retry on next refresh");
+            }
+            match inflight.lock() {
+                Ok(mut set) => {
+                    set.remove(&cid);
+                }
+                Err(poisoned) => {
+                    poisoned.into_inner().remove(&cid);
+                }
+            }
+            info!(
+                count = downloaded,
+                failed, "dslice background downloads complete"
+            );
+        });
+    }
+
     fn load_from_cache(&mut self, active_ids: &HashSet<String>) {
         let cache_dir = &self.cache_dir;
         let entries = match std::fs::read_dir(cache_dir) {
@@ -438,34 +506,55 @@ impl CircuitStore {
         };
 
         for entry in entries.flatten() {
-            let dir_name = entry.file_name().to_string_lossy().to_string();
-            let circuit_id = match dir_name.strip_prefix("model_") {
-                Some(id) if id.len() == 64 => id.to_string(),
-                _ => continue,
-            };
-
-            if !active_ids.is_empty() && !active_ids.contains(&circuit_id) {
-                continue;
+            if let Some((circuit_id, circuit)) =
+                self.try_load_cache_entry(&entry, active_ids, cache_dir)
+            {
+                self.circuits.insert(circuit_id, circuit);
             }
-            if self.circuits.contains_key(&circuit_id) {
-                continue;
-            }
+        }
+    }
 
-            let metadata_path = entry.path().join(CIRCUIT_METADATA_FILENAME);
-            if !metadata_path.exists() {
-                continue;
-            }
+    fn try_load_cache_entry(
+        &self,
+        entry: &std::fs::DirEntry,
+        active_ids: &HashSet<String>,
+        cache_dir: &Path,
+    ) -> Option<(String, Circuit)> {
+        let dir_name = entry.file_name().to_string_lossy().to_string();
+        let circuit_id = match dir_name.strip_prefix("model_") {
+            Some(id) if id.len() == 64 => id.to_string(),
+            _ => return None,
+        };
 
-            match load_circuit_from_cache(&circuit_id, &entry.path(), &self.cache_dir) {
-                Ok(circuit) => {
-                    if circuit.metadata.circuit_type == CircuitType::DSPERSE_PROOF_GENERATION {
-                        migrate_dslice_layout(&entry.path());
+        if IGNORED_MODEL_HASHES.contains(&circuit_id.as_str()) {
+            return None;
+        }
+        if !active_ids.is_empty() && !active_ids.contains(&circuit_id) {
+            return None;
+        }
+        if self.circuits.contains_key(&circuit_id) {
+            return None;
+        }
+
+        let metadata_path = entry.path().join(CIRCUIT_METADATA_FILENAME);
+        if !metadata_path.exists() {
+            return None;
+        }
+
+        match load_circuit_from_cache(&circuit_id, &entry.path(), cache_dir) {
+            Ok(circuit) => {
+                if circuit.metadata.circuit_type == CircuitType::DSPERSE_PROOF_GENERATION {
+                    migrate_dslice_layout(&entry.path());
+                    if !entry.path().join(DSLICE_READY_MARKER).exists() {
+                        warn!(id = %circuit_id, "skipping incomplete DSPERSE circuit from cache");
+                        return None;
                     }
-                    self.circuits.insert(circuit_id, circuit);
                 }
-                Err(e) => {
-                    warn!(id = circuit_id, error = %e, "failed to load cached circuit");
-                }
+                Some((circuit_id, circuit))
+            }
+            Err(e) => {
+                warn!(id = circuit_id, error = %e, "failed to load cached circuit");
+                None
             }
         }
     }
@@ -656,6 +745,36 @@ pub fn ensure_slice_extracted(slices_dir: &Path, slice_id: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+fn resolve_dslice_download(
+    cache_path: &Path,
+    filename: &str,
+    checksums: &serde_json::Map<String, serde_json::Value>,
+    url_val: &serde_json::Value,
+) -> Result<Option<(String, PathBuf)>> {
+    let archive_dest = cache_path.join("slices").join(filename);
+    let slice_name = filename.trim_end_matches(".dslice");
+    let extracted_dir = cache_path.join("slices").join(slice_name);
+    if archive_dest.exists() {
+        if file_checksum_valid(&archive_dest, checksums, filename) {
+            return Ok(None);
+        }
+        warn!(file = %filename, "SHA-256 mismatch, removing corrupted dslice");
+        std::fs::remove_file(&archive_dest)
+            .with_context(|| format!("removing corrupted archive {}", archive_dest.display()))?;
+        if extracted_dir.exists() {
+            std::fs::remove_dir_all(&extracted_dir).with_context(|| {
+                format!("removing stale extracted dir {}", extracted_dir.display())
+            })?;
+        }
+    } else if extracted_dir.exists() {
+        return Ok(None);
+    }
+    let url = url_val
+        .as_str()
+        .with_context(|| format!("dslice {filename} has non-string URL value: {url_val}"))?;
+    Ok(Some((url.to_string(), archive_dest)))
 }
 
 fn file_checksum_valid(
