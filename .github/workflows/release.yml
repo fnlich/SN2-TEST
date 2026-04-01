@@ -91,43 +91,21 @@ jobs:
           cd ..
           sha256sum sn2-validator-linux-x86_64 sn2-miner-linux-x86_64 sn2-validator-linux-aarch64 sn2-miner-linux-aarch64 sn2-validator-macos-aarch64 sn2-miner-macos-aarch64 > SHA256SUMS
 
-      - name: Update Testnet Release
+      - name: Create Testnet Release
         run: |
-          if gh release view testnet-latest >/dev/null 2>&1; then
-            gh release delete-asset testnet-latest sn2-validator-linux-x86_64 --yes || true
-            gh release delete-asset testnet-latest sn2-miner-linux-x86_64 --yes || true
-            gh release delete-asset testnet-latest sn2-validator-linux-aarch64 --yes || true
-            gh release delete-asset testnet-latest sn2-miner-linux-aarch64 --yes || true
-            gh release delete-asset testnet-latest sn2-validator-macos-aarch64 --yes || true
-            gh release delete-asset testnet-latest sn2-miner-macos-aarch64 --yes || true
-            gh release delete-asset testnet-latest SHA256SUMS --yes || true
-            gh release edit testnet-latest \
-              --title "Testnet (latest)" \
-              --notes "Built from ${{ github.sha }}" \
-              --prerelease \
-              --target testnet
-            gh release upload testnet-latest \
-              sn2-validator-linux-x86_64 \
-              sn2-miner-linux-x86_64 \
-              sn2-validator-linux-aarch64 \
-              sn2-miner-linux-aarch64 \
-              sn2-validator-macos-aarch64 \
-              sn2-miner-macos-aarch64 \
-              SHA256SUMS
-          else
-            gh release create testnet-latest \
-              --title "Testnet (latest)" \
-              --notes "Built from ${{ github.sha }}" \
-              --prerelease \
-              --target testnet \
-              sn2-validator-linux-x86_64 \
-              sn2-miner-linux-x86_64 \
-              sn2-validator-linux-aarch64 \
-              sn2-miner-linux-aarch64 \
-              sn2-validator-macos-aarch64 \
-              sn2-miner-macos-aarch64 \
-              SHA256SUMS
-          fi
+          TAG="testnet-$(echo ${{ github.sha }} | cut -c1-8)"
+          gh release create "$TAG" \
+            --title "Testnet ($TAG)" \
+            --notes "Built from ${{ github.sha }}" \
+            --prerelease \
+            --target testnet \
+            sn2-validator-linux-x86_64 \
+            sn2-miner-linux-x86_64 \
+            sn2-validator-linux-aarch64 \
+            sn2-miner-linux-aarch64 \
+            sn2-validator-macos-aarch64 \
+            sn2-miner-macos-aarch64 \
+            SHA256SUMS
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
