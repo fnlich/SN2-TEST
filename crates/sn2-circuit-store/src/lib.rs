@@ -111,6 +111,7 @@ pub struct CircuitStore {
     api_url_overridden: bool,
     pinned_ids: HashSet<String>,
     inflight_downloads: Arc<Mutex<HashSet<String>>>,
+    component_sha_map: HashMap<(String, String), String>,
 }
 
 impl CircuitStore {
@@ -138,6 +139,7 @@ impl CircuitStore {
                 .filter(|s| !s.is_empty())
                 .collect(),
             inflight_downloads: Arc::new(Mutex::new(HashSet::new())),
+            component_sha_map: HashMap::new(),
         }
     }
 
@@ -186,9 +188,14 @@ impl CircuitStore {
                     continue;
                 }
                 match self.cache_and_load_circuit(id, circuit_data).await {
-                    Ok(circuit) => {
+                    Ok((circuit, sha_mappings)) => {
                         if !is_loaded {
                             info!(id = id, name = %circuit.metadata.name, "loaded circuit from API");
+                        }
+                        self.component_sha_map.retain(|(mid, _), _| mid != id);
+                        for (slice_name, comp_sha) in sha_mappings {
+                            self.component_sha_map
+                                .insert((id.to_string(), slice_name), comp_sha);
                         }
                         self.circuits.insert(id.to_string(), circuit);
                     }
@@ -218,7 +225,13 @@ impl CircuitStore {
 
         info!(id = circuit_id, "circuit not loaded, fetching from API");
         let data = self.fetch_circuit_or_model(circuit_id).await?;
-        let circuit = self.cache_and_load_circuit(circuit_id, &data).await?;
+        let (circuit, sha_mappings) = self.cache_and_load_circuit(circuit_id, &data).await?;
+        self.component_sha_map
+            .retain(|(mid, _), _| mid != circuit_id);
+        for (slice_name, comp_sha) in sha_mappings {
+            self.component_sha_map
+                .insert((circuit_id.to_string(), slice_name), comp_sha);
+        }
         self.circuits
             .insert(circuit_id.to_string(), circuit.clone());
         Ok(circuit)
@@ -241,8 +254,13 @@ impl CircuitStore {
                     continue;
                 }
                 match self.cache_and_load_circuit(id, circuit_data).await {
-                    Ok(circuit) => {
+                    Ok((circuit, sha_mappings)) => {
                         info!(id = id, name = %circuit.metadata.name, "loaded new circuit");
+                        self.component_sha_map.retain(|(mid, _), _| mid != id);
+                        for (slice_name, comp_sha) in sha_mappings {
+                            self.component_sha_map
+                                .insert((id.to_string(), slice_name), comp_sha);
+                        }
                         self.circuits.insert(id.to_string(), circuit);
                     }
                     Err(e) => {
@@ -316,6 +334,12 @@ impl CircuitStore {
 
     pub fn cache_dir(&self) -> &Path {
         &self.cache_dir
+    }
+
+    pub fn component_sha(&self, model_id: &str, slice_name: &str) -> Option<&str> {
+        self.component_sha_map
+            .get(&(model_id.to_string(), slice_name.to_string()))
+            .map(String::as_str)
     }
 
     pub const REFRESH_INTERVAL: u64 = REFRESH_INTERVAL_SECS;
@@ -506,7 +530,7 @@ impl CircuitStore {
         &self,
         circuit_id: &str,
         data: &serde_json::Value,
-    ) -> Result<Circuit> {
+    ) -> Result<(Circuit, Vec<(String, String)>)> {
         let cache_path = self.cache_dir.join(format!("model_{circuit_id}"));
         let is_fresh = !cache_path.exists();
         std::fs::create_dir_all(&cache_path)
@@ -528,12 +552,15 @@ impl CircuitStore {
                 .is_some_and(|a| !a.is_empty())
         });
 
+        let mut sha_mappings = Vec::new();
         if has_composition && is_dsperse {
             match self
                 .download_composable_model(circuit_id, data, &cache_path)
                 .await
             {
-                Ok(()) => {}
+                Ok(mappings) => {
+                    sha_mappings = mappings;
+                }
                 Err(e) => {
                     if is_fresh {
                         let _ = std::fs::remove_dir_all(&cache_path);
@@ -597,17 +624,20 @@ impl CircuitStore {
                 ProofSystem::JSTPROVE
             });
 
-        Ok(Circuit {
-            id: circuit_id.to_string(),
-            paths: CircuitPaths::new(
-                &format!("model_{circuit_id}"),
-                &self.cache_dir.to_string_lossy(),
-            ),
-            metadata,
-            proof_system,
-            settings,
-            timeout: CIRCUIT_TIMEOUT_SECONDS as f64,
-        })
+        Ok((
+            Circuit {
+                id: circuit_id.to_string(),
+                paths: CircuitPaths::new(
+                    &format!("model_{circuit_id}"),
+                    &self.cache_dir.to_string_lossy(),
+                ),
+                metadata,
+                proof_system,
+                settings,
+                timeout: CIRCUIT_TIMEOUT_SECONDS as f64,
+            },
+            sha_mappings,
+        ))
     }
 
     async fn download_composable_model(
@@ -615,7 +645,7 @@ impl CircuitStore {
         model_id: &str,
         data: &serde_json::Value,
         cache_path: &Path,
-    ) -> Result<()> {
+    ) -> Result<Vec<(String, String)>> {
         let composition = data.get("composition").context("missing composition")?;
         let components = composition
             .get("components")
@@ -643,10 +673,22 @@ impl CircuitStore {
             .remove(model_id);
 
         match result {
-            Ok(()) => {
-                let _ = std::fs::write(cache_path.join(DSLICE_READY_MARKER), b"");
+            Ok(sha_mappings) => {
+                let shas_persisted = serde_json::to_string(&sha_mappings)
+                    .map_err(|e| {
+                        warn!(model_id, error = %e, "failed to serialize component SHA mappings");
+                    })
+                    .and_then(|json| {
+                        std::fs::write(cache_path.join("component_shas.json"), json).map_err(|e| {
+                            warn!(model_id, error = %e, "failed to persist component SHA mappings");
+                        })
+                    })
+                    .is_ok();
+                if shas_persisted {
+                    let _ = std::fs::write(cache_path.join(DSLICE_READY_MARKER), b"");
+                }
                 info!(model_id, total, "composable model download complete");
-                Ok(())
+                Ok(sha_mappings)
             }
             Err(e) => {
                 let _ = std::fs::remove_file(cache_path.join(DSLICE_READY_MARKER));
@@ -673,8 +715,9 @@ impl CircuitStore {
         components: &[serde_json::Value],
         model_id: &str,
         data: &serde_json::Value,
-    ) -> Result<()> {
+    ) -> Result<Vec<(String, String)>> {
         let total = components.len();
+        let mut sha_mappings: Vec<(String, String)> = Vec::with_capacity(total);
 
         for (idx, comp) in components.iter().enumerate() {
             let default_name = format!("slice_{idx}");
@@ -687,6 +730,24 @@ impl CircuitStore {
                 .get("sha256")
                 .and_then(|v| v.as_str())
                 .context("component missing sha256")?;
+            sha_mappings.push((comp_name.to_string(), comp_sha.to_string()));
+
+            let comp_dir = slices_dir.join(comp_name);
+            let stamp_path = comp_dir.join("component.sha");
+            let sha_matches = stamp_path
+                .exists()
+                .then(|| std::fs::read_to_string(&stamp_path).ok())
+                .flatten()
+                .is_some_and(|s| s.trim() == comp_sha);
+            if comp_dir.exists() && !sha_matches {
+                info!(
+                    comp_name,
+                    comp_sha, "component SHA changed, clearing stale cache"
+                );
+                std::fs::remove_dir_all(&comp_dir)
+                    .with_context(|| format!("removing stale component cache for {comp_name}"))?;
+            }
+
             let comp_files = comp
                 .get("files")
                 .and_then(|v| v.as_array())
@@ -752,6 +813,10 @@ impl CircuitStore {
                     .with_context(|| format!("downloading weight blob for {comp_name}"))?;
             }
 
+            if let Err(e) = std::fs::write(&stamp_path, comp_sha) {
+                warn!(comp_name, error = %e, "failed to write component SHA stamp");
+            }
+
             if (idx + 1) % 50 == 0 || idx + 1 == total {
                 info!(
                     model_id,
@@ -790,7 +855,7 @@ impl CircuitStore {
             }
         }
 
-        Ok(())
+        Ok(sha_mappings)
     }
 
     async fn download_circuit_files(
@@ -932,6 +997,24 @@ impl CircuitStore {
             if let Some((circuit_id, circuit)) =
                 self.try_load_cache_entry(&entry, active_ids, cache_dir)
             {
+                let shas_path = entry.path().join("component_shas.json");
+                match std::fs::read_to_string(&shas_path) {
+                    Ok(data) => match serde_json::from_str::<Vec<(String, String)>>(&data) {
+                        Ok(mappings) => {
+                            for (slice_name, comp_sha) in mappings {
+                                self.component_sha_map
+                                    .insert((circuit_id.clone(), slice_name), comp_sha);
+                            }
+                        }
+                        Err(e) => {
+                            warn!(id = %circuit_id, path = %shas_path.display(), error = %e, "corrupt component_shas.json");
+                        }
+                    },
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        warn!(id = %circuit_id, path = %shas_path.display(), error = %e, "failed to read component_shas.json");
+                    }
+                    _ => {}
+                }
                 self.circuits.insert(circuit_id, circuit);
             }
         }
