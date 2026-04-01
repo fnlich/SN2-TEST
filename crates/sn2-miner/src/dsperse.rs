@@ -16,6 +16,15 @@ fn validate_circuit_id(id: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn normalize_slice_id(slice_num: &str) -> Result<String> {
+    let idx: usize = slice_num
+        .strip_prefix("slice_")
+        .unwrap_or(slice_num)
+        .parse()
+        .context("parsing slice_num")?;
+    Ok(format!("slice_{idx}"))
+}
+
 fn find_slice_onnx(slice_dir: &Path) -> Result<PathBuf> {
     let payload_dir = slice_dir.join("payload");
     if payload_dir.is_dir() {
@@ -86,42 +95,82 @@ impl DSperseClient {
         Self { cache_dir }
     }
 
-    pub async fn prove_slice(
+    pub async fn resolve_component(
         &self,
-        circuit_id: &str,
-        slice_num: &str,
-        inputs: &serde_json::Value,
-        component_sha: Option<&str>,
-    ) -> Result<serde_json::Value> {
-        validate_circuit_id(circuit_id)?;
+        component_sha: &str,
+        slice_id: &str,
+    ) -> Result<Option<PathBuf>> {
+        let cache_dir = self.cache_dir.clone();
+        let component_sha = component_sha.to_string();
+        let slice_id = slice_id.to_string();
+        tokio::task::spawn_blocking(move || -> Result<Option<PathBuf>> {
+            let entries = match std::fs::read_dir(&cache_dir) {
+                Ok(e) => e,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "reading cache directory {}: {e}",
+                        cache_dir.display()
+                    ))
+                }
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if !name_str.starts_with("model_") {
+                    continue;
+                }
+                let stamp_path = entry
+                    .path()
+                    .join("slices")
+                    .join(&slice_id)
+                    .join("component.sha");
+                if let Ok(stamp) = std::fs::read_to_string(&stamp_path) {
+                    if stamp.trim() == component_sha {
+                        let slice_dir = entry.path().join("slices").join(&slice_id);
+                        if slice_dir.join("jstprove").join("circuit.bundle").is_dir() {
+                            return Ok(Some(slice_dir));
+                        }
+                    }
+                }
+            }
+            Ok(None)
+        })
+        .await
+        .context("component resolution task panicked")?
+    }
+
+    async fn resolve_model_slice(&self, circuit_id: &str, slice_id: &str) -> Result<PathBuf> {
         let slices_dir = self
             .cache_dir
             .join(format!("model_{circuit_id}"))
             .join("slices");
-        let slice_idx: usize = slice_num
-            .strip_prefix("slice_")
-            .unwrap_or(slice_num)
-            .parse()
-            .context("parsing slice_num")?;
-
-        let slice_id = format!("slice_{slice_idx}");
         tokio::task::spawn_blocking({
             let slices_dir = slices_dir.clone();
-            let slice_id = slice_id.clone();
+            let slice_id = slice_id.to_string();
             move || sn2_circuit_store::ensure_slice_extracted(&slices_dir, &slice_id)
         })
         .await
         .context("slice extraction task panicked")?
         .with_context(|| format!("extracting dslice archive for {slice_id}"))?;
+        Ok(slices_dir.join(slice_id))
+    }
 
-        let slice_dir = slices_dir.join(&slice_id);
-        if let Some(sha) = component_sha {
-            info!(
-                component_sha = sha,
-                slice = slice_num,
-                "proving component-addressed slice"
-            );
-        }
+    pub async fn prove_slice(
+        &self,
+        circuit_id: &str,
+        slice_num: &str,
+        inputs: &serde_json::Value,
+        resolved_component_dir: Option<PathBuf>,
+    ) -> Result<serde_json::Value> {
+        validate_circuit_id(circuit_id)?;
+        let slice_id = normalize_slice_id(slice_num)?;
+
+        let slice_dir = match resolved_component_dir {
+            Some(dir) => dir,
+            None => self.resolve_model_slice(circuit_id, &slice_id).await?,
+        };
+
         let circuit_path = slice_dir.join("jstprove").join("circuit.bundle");
         let onnx_path = find_slice_onnx(&slice_dir)?;
 

@@ -6,7 +6,7 @@ use tracing::info;
 
 use sn2_types::*;
 
-use crate::dsperse::DSperseClient;
+use crate::dsperse::{normalize_slice_id, DSperseClient};
 
 pub struct MinerHandlers {
     dsperse: DSperseClient,
@@ -94,7 +94,15 @@ impl MinerHandlers {
             "handling DSlice"
         );
 
-        if !circuit_id.is_empty() {
+        let resolved_dir = match component_sha {
+            Some(sha) => {
+                let slice_id = normalize_slice_id(slice_num)?;
+                self.dsperse.resolve_component(sha, &slice_id).await?
+            }
+            None => None,
+        };
+
+        if resolved_dir.is_none() && !circuit_id.is_empty() {
             self.ensure_circuit_cached(circuit_id).await?;
         }
 
@@ -104,7 +112,7 @@ impl MinerHandlers {
                 circuit_id,
                 slice_num,
                 &data.inputs.unwrap_or(json!({})),
-                component_sha,
+                resolved_dir,
             )
             .await?;
 
