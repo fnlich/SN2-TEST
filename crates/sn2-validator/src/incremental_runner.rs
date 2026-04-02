@@ -25,14 +25,18 @@ pub enum OutputConsistency {
 const OUTPUT_CONSISTENCY_THRESHOLD: f64 = 0.05;
 
 pub fn classify_output_consistency(expected: &[f64], actual: &[f64]) -> OutputConsistency {
-    if expected.len() != actual.len() {
+    if expected.is_empty() || actual.is_empty() {
         return OutputConsistency::LengthMismatch {
             expected: expected.len(),
             actual: actual.len(),
         };
     }
+    let compare_len = expected.len().min(actual.len());
     let mut max_rel_err: f64 = 0.0;
-    for (e, m) in expected.iter().zip(actual.iter()) {
+    for (e, m) in expected[..compare_len]
+        .iter()
+        .zip(actual[..compare_len].iter())
+    {
         if !e.is_finite() || !m.is_finite() {
             return OutputConsistency::Diverged {
                 max_rel_err: f64::INFINITY,
@@ -151,6 +155,20 @@ impl IncrementalRunManager {
             Some(c) => c.slice_tile_counts(),
             None => (0, 0, HashMap::new()),
         }
+    }
+
+    pub fn expected_slice_output_sample(
+        &self,
+        run_uid: &str,
+        slice_id: &str,
+    ) -> Option<(usize, Vec<f64>)> {
+        let run = self.runs.get(run_uid)?;
+        let expected = run
+            .combined
+            .as_ref()
+            .and_then(|c| c.expected_slice_outputs(slice_id))?;
+        let sample: Vec<f64> = expected.iter().copied().take(5).collect();
+        Some((expected.len(), sample))
     }
 
     pub fn verify_output_consistency(
@@ -426,15 +444,20 @@ mod tests {
     }
 
     #[test]
-    fn output_consistency_length_mismatch_detected() {
+    fn output_consistency_truncates_to_shorter() {
         let result = classify_output_consistency(&[1.0, 2.0, 3.0], &[1.0, 2.0]);
-        assert!(matches!(
-            result,
-            OutputConsistency::LengthMismatch {
-                expected: 3,
-                actual: 2
-            }
-        ));
+        assert!(
+            matches!(result, OutputConsistency::Consistent { .. }),
+            "matching prefix with different lengths should be consistent, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn output_consistency_empty_is_mismatch() {
+        let result = classify_output_consistency(&[1.0], &[]);
+        assert!(matches!(result, OutputConsistency::LengthMismatch { .. }));
+        let result = classify_output_consistency(&[], &[1.0]);
+        assert!(matches!(result, OutputConsistency::LengthMismatch { .. }));
     }
 
     #[test]

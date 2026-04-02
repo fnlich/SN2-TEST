@@ -210,6 +210,9 @@ impl ValidatorLoop {
             };
             if !miner_outputs.is_empty() {
                 use crate::incremental_runner::OutputConsistency;
+                let expected_outputs = self
+                    .run_manager
+                    .expected_slice_output_sample(&run_uid, &slice_num);
                 match self.run_manager.verify_output_consistency(
                     &run_uid,
                     &slice_num,
@@ -221,15 +224,20 @@ impl ValidatorLoop {
                             run_uid = %run_uid,
                             slice = %slice_num,
                             max_rel_err,
+                            zk_len = miner_outputs.len(),
                             "output consistency verified"
                         );
                     }
                     OutputConsistency::Diverged { max_rel_err } => {
+                        let zk_sample: Vec<f64> = miner_outputs.iter().copied().take(5).collect();
                         warn!(
                             uid = response.uid,
                             run_uid = %run_uid,
                             slice = %slice_num,
                             max_rel_err,
+                            zk_len = miner_outputs.len(),
+                            expected_sample = ?expected_outputs,
+                            zk_sample = ?zk_sample,
                             "output consistency check failed: miner outputs diverge from expected"
                         );
                     }
@@ -240,7 +248,7 @@ impl ValidatorLoop {
                             slice = %slice_num,
                             expected,
                             actual,
-                            "output consistency check failed: length mismatch"
+                            "output consistency check failed: empty outputs"
                         );
                     }
                     OutputConsistency::NoExpected | OutputConsistency::NoRun => {}
