@@ -157,36 +157,22 @@ impl IncrementalRunManager {
         }
     }
 
-    pub fn expected_slice_output_sample(
-        &self,
-        run_uid: &str,
-        slice_id: &str,
-    ) -> Option<(usize, Vec<f64>)> {
-        let run = self.runs.get(run_uid)?;
-        let expected = run
-            .combined
-            .as_ref()
-            .and_then(|c| c.expected_slice_outputs(slice_id))?;
-        let sample: Vec<f64> = expected.iter().copied().take(5).collect();
-        Some((expected.len(), sample))
-    }
-
     pub fn verify_output_consistency(
         &self,
         run_uid: &str,
-        slice_id: &str,
         miner_outputs: &[f64],
         input_norm_factor: Option<f64>,
+        circuit_output_names: &[String],
     ) -> OutputConsistency {
         let run = match self.runs.get(run_uid) {
             Some(r) => r,
             None => return OutputConsistency::NoRun,
         };
-        let expected = match run
-            .combined
-            .as_ref()
-            .and_then(|c| c.expected_slice_outputs(slice_id))
-        {
+        let combined = match run.combined.as_ref() {
+            Some(c) => c,
+            None => return OutputConsistency::NoExpected,
+        };
+        let expected = match combined.outputs_for_names(circuit_output_names) {
             Some(e) => e,
             None => return OutputConsistency::NoExpected,
         };
@@ -439,14 +425,14 @@ mod tests {
     #[test]
     fn output_consistency_no_run() {
         let mgr = IncrementalRunManager::new();
-        let result = mgr.verify_output_consistency("nonexistent", "slice_0", &[1.0, 2.0], None);
+        let result = mgr.verify_output_consistency("nonexistent", &[1.0, 2.0], None, &[]);
         assert!(matches!(result, OutputConsistency::NoRun));
     }
 
     #[test]
     fn output_consistency_no_combined() {
         let mgr = make_manager_with_run("run-1");
-        let result = mgr.verify_output_consistency("run-1", "slice_0", &[1.0, 2.0], None);
+        let result = mgr.verify_output_consistency("run-1", &[1.0, 2.0], None, &[]);
         assert!(matches!(result, OutputConsistency::NoExpected));
     }
 
