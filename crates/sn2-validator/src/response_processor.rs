@@ -25,19 +25,33 @@ fn resolve_circuit_path(response: &MinerResponse, circuit: &Circuit) -> String {
     circuit.paths.compiled_model.to_string_lossy().to_string()
 }
 
-fn resolve_num_inputs(circuit: &Circuit, inputs: &Option<serde_json::Value>) -> usize {
-    circuit
+fn resolve_num_inputs(
+    circuit: &Circuit,
+    inputs: &Option<serde_json::Value>,
+    circuit_path: &str,
+) -> usize {
+    if let Some(n) = circuit
         .settings
         .get("num_inputs")
         .and_then(|v| v.as_u64())
         .map(|n| n as usize)
-        .unwrap_or_else(|| {
-            inputs
-                .as_ref()
-                .and_then(|v| v.get("input_data"))
-                .map(|v| sn2_types::json_tensor::flatten_json_to_f64(v).len())
-                .unwrap_or(0)
-        })
+    {
+        return n;
+    }
+
+    let backend = dsperse::backend::jstprove::JstproveBackend::new();
+    if let Ok(Some(params)) = backend.load_params(std::path::Path::new(circuit_path)) {
+        let dims = params.effective_input_dims();
+        if dims > 0 {
+            return dims;
+        }
+    }
+
+    inputs
+        .as_ref()
+        .and_then(|v| v.get("input_data"))
+        .map(|v| sn2_types::json_tensor::flatten_json_to_f64(v).len())
+        .unwrap_or(0)
 }
 
 fn compute_slice_stats(data: &[f64]) -> (f64, usize, usize, usize) {
@@ -111,7 +125,7 @@ impl ResponseProcessor {
             return Ok(false);
         }
 
-        let num_inputs = resolve_num_inputs(circuit, &response.inputs);
+        let num_inputs = resolve_num_inputs(circuit, &response.inputs, &circuit_path);
 
         let expected_inputs: Option<Vec<f64>> = response
             .inputs
