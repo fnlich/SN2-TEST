@@ -734,18 +734,23 @@ impl CircuitStore {
 
             let comp_dir = slices_dir.join(comp_name);
             let stamp_path = comp_dir.join("component.sha");
-            let sha_matches = stamp_path
-                .exists()
-                .then(|| std::fs::read_to_string(&stamp_path).ok())
-                .flatten()
-                .is_some_and(|s| s.trim() == comp_sha);
-            if comp_dir.exists() && !sha_matches {
-                info!(
-                    comp_name,
-                    comp_sha, "component SHA changed, clearing stale cache"
-                );
-                std::fs::remove_dir_all(&comp_dir)
-                    .with_context(|| format!("removing stale component cache for {comp_name}"))?;
+            match std::fs::read_to_string(&stamp_path) {
+                Ok(stamp) if stamp.trim() != comp_sha => {
+                    info!(
+                        comp_name,
+                        comp_sha,
+                        old_sha = stamp.trim(),
+                        "component SHA changed, clearing stale cache"
+                    );
+                    std::fs::remove_dir_all(&comp_dir).with_context(|| {
+                        format!("removing stale component cache for {comp_name}")
+                    })?;
+                }
+                Err(_) if comp_dir.exists() => {
+                    info!(comp_name, comp_sha, "writing stamp for existing component");
+                    let _ = std::fs::write(&stamp_path, comp_sha);
+                }
+                _ => {}
             }
 
             let comp_files = comp
