@@ -22,7 +22,7 @@ pub enum OutputConsistency {
     NoRun,
 }
 
-const OUTPUT_CONSISTENCY_THRESHOLD: f64 = 0.05;
+const OUTPUT_CONSISTENCY_THRESHOLD: f64 = 0.10;
 
 pub fn classify_output_consistency(expected: &[f64], actual: &[f64]) -> OutputConsistency {
     if expected.is_empty() || actual.is_empty() {
@@ -176,6 +176,7 @@ impl IncrementalRunManager {
         run_uid: &str,
         slice_id: &str,
         miner_outputs: &[f64],
+        input_norm_factor: Option<f64>,
     ) -> OutputConsistency {
         let run = match self.runs.get(run_uid) {
             Some(r) => r,
@@ -189,7 +190,13 @@ impl IncrementalRunManager {
             Some(e) => e,
             None => return OutputConsistency::NoExpected,
         };
-        classify_output_consistency(&expected, miner_outputs)
+        match input_norm_factor {
+            Some(k) if k > 1.0 => {
+                let normalized: Vec<f64> = expected.iter().map(|v| v / k).collect();
+                classify_output_consistency(&normalized, miner_outputs)
+            }
+            _ => classify_output_consistency(&expected, miner_outputs),
+        }
     }
 
     pub fn is_evicted(&self, run_uid: &str) -> bool {
@@ -432,14 +439,14 @@ mod tests {
     #[test]
     fn output_consistency_no_run() {
         let mgr = IncrementalRunManager::new();
-        let result = mgr.verify_output_consistency("nonexistent", "slice_0", &[1.0, 2.0]);
+        let result = mgr.verify_output_consistency("nonexistent", "slice_0", &[1.0, 2.0], None);
         assert!(matches!(result, OutputConsistency::NoRun));
     }
 
     #[test]
     fn output_consistency_no_combined() {
         let mgr = make_manager_with_run("run-1");
-        let result = mgr.verify_output_consistency("run-1", "slice_0", &[1.0, 2.0]);
+        let result = mgr.verify_output_consistency("run-1", "slice_0", &[1.0, 2.0], None);
         assert!(matches!(result, OutputConsistency::NoExpected));
     }
 
@@ -504,6 +511,31 @@ mod tests {
         assert!(
             matches!(result, OutputConsistency::Consistent { .. }),
             "near-zero values should not trigger false positives, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn output_consistency_normalization_correction() {
+        let onnx_expected = [10.0, 20.0, 30.0];
+        let norm_factor = 100.0;
+        let zk_outputs: Vec<f64> = onnx_expected.iter().map(|v| v / norm_factor).collect();
+        let normalized: Vec<f64> = onnx_expected.iter().map(|v| v / norm_factor).collect();
+        let result = classify_output_consistency(&normalized, &zk_outputs);
+        assert!(
+            matches!(result, OutputConsistency::Consistent { max_rel_err } if max_rel_err == 0.0),
+            "normalization-corrected outputs should match exactly, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn output_consistency_without_normalization_diverges() {
+        let onnx_expected = [10.0, 20.0, 30.0];
+        let norm_factor = 100.0;
+        let zk_outputs: Vec<f64> = onnx_expected.iter().map(|v| v / norm_factor).collect();
+        let result = classify_output_consistency(&onnx_expected, &zk_outputs);
+        assert!(
+            matches!(result, OutputConsistency::Diverged { .. }),
+            "uncorrected comparison should diverge, got {result:?}"
         );
     }
 

@@ -210,13 +210,15 @@ impl ValidatorLoop {
             };
             if !miner_outputs.is_empty() {
                 use crate::incremental_runner::OutputConsistency;
-                let expected_outputs = self
-                    .run_manager
-                    .expected_slice_output_sample(&run_uid, &slice_num);
+                let norm_factor = self
+                    .dslice_input_scales
+                    .get(&(run_uid.clone(), slice_num.clone()))
+                    .copied();
                 match self.run_manager.verify_output_consistency(
                     &run_uid,
                     &slice_num,
                     &miner_outputs,
+                    norm_factor,
                 ) {
                     OutputConsistency::Consistent { max_rel_err } => {
                         tracing::debug!(
@@ -230,13 +232,17 @@ impl ValidatorLoop {
                     }
                     OutputConsistency::Diverged { max_rel_err } => {
                         let zk_sample: Vec<f64> = miner_outputs.iter().copied().take(5).collect();
+                        let expected_sample = self
+                            .run_manager
+                            .expected_slice_output_sample(&run_uid, &slice_num);
                         warn!(
                             uid = response.uid,
                             run_uid = %run_uid,
                             slice = %slice_num,
                             max_rel_err,
+                            norm_factor = ?norm_factor,
                             zk_len = miner_outputs.len(),
-                            expected_sample = ?expected_outputs,
+                            expected_sample = ?expected_sample,
                             zk_sample = ?zk_sample,
                             "output consistency check failed: miner outputs diverge from expected"
                         );
