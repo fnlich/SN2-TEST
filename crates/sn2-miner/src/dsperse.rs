@@ -128,9 +128,13 @@ impl DSperseClient {
                 if let Ok(stamp) = std::fs::read_to_string(&stamp_path) {
                     if stamp.trim() == component_sha {
                         let slice_dir = entry.path().join("slices").join(&slice_id);
-                        if slice_dir.join("jstprove").join("circuit.bundle").is_dir() {
-                            return Ok(Some(slice_dir));
+                        if !slice_dir.join("jstprove").join("circuit.bundle").is_dir() {
+                            continue;
                         }
+                        if find_slice_onnx(&slice_dir).is_err() {
+                            continue;
+                        }
+                        return Ok(Some(slice_dir));
                     }
                 }
             }

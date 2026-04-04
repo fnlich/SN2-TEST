@@ -106,14 +106,33 @@ impl MinerHandlers {
             self.ensure_circuit_cached(circuit_id).await?;
         }
 
+        let inputs = data.inputs.unwrap_or(json!({}));
+
+        if let Some(ref dir) = resolved_dir {
+            match self
+                .dsperse
+                .prove_slice(circuit_id, slice_num, &inputs, resolved_dir.clone())
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    tracing::warn!(
+                        circuit = circuit_id,
+                        slice = slice_num,
+                        dir = %dir.display(),
+                        error = %e,
+                        "component-resolved path failed, falling back to model path"
+                    );
+                    if !circuit_id.is_empty() {
+                        self.ensure_circuit_cached(circuit_id).await?;
+                    }
+                }
+            }
+        }
+
         let result = self
             .dsperse
-            .prove_slice(
-                circuit_id,
-                slice_num,
-                &data.inputs.unwrap_or(json!({})),
-                resolved_dir,
-            )
+            .prove_slice(circuit_id, slice_num, &inputs, None)
             .await?;
 
         Ok(result)
