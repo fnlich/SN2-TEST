@@ -144,10 +144,9 @@ pub struct ValidatorLoop {
     pub(super) uid_hotkeys: HashMap<u16, String>,
     pub(super) pow_manager: PowManager,
     pub(super) dispatch_notify: Arc<Notify>,
-    pub(super) task_meta: HashMap<tokio::task::Id, (u16, Option<String>, bool)>,
+    pub(super) task_meta: HashMap<tokio::task::Id, (u16, Option<String>)>,
     pub(super) run_manager: IncrementalRunManager,
     pub(super) proof_uploader: Option<Arc<ProofUploader>>,
-    pub(super) benchmark_in_flight: usize,
     pub(super) upload_tasks: JoinSet<()>,
     pub(super) weight_tasks: JoinSet<WeightTaskResult>,
     pub(super) dsperse_benchmark_backoff_until: Instant,
@@ -160,7 +159,6 @@ pub struct ValidatorLoop {
     pub(super) pending_verifications: VecDeque<TaskResult>,
     pub(super) verification_concurrency: usize,
     pub(super) dslice_input_scales: HashMap<(String, String), f64>,
-    pub(super) active_extracted_slices: HashMap<String, Vec<(std::path::PathBuf, String)>>,
 }
 
 impl ValidatorLoop {
@@ -321,7 +319,6 @@ impl ValidatorLoop {
             task_meta: HashMap::new(),
             run_manager,
             proof_uploader,
-            benchmark_in_flight: 0,
             upload_tasks: JoinSet::new(),
             weight_tasks: JoinSet::new(),
             dsperse_benchmark_backoff_until: now,
@@ -334,7 +331,6 @@ impl ValidatorLoop {
             pending_verifications: VecDeque::new(),
             verification_concurrency,
             dslice_input_scales: HashMap::new(),
-            active_extracted_slices: HashMap::new(),
         })
     }
 
@@ -398,13 +394,10 @@ impl ValidatorLoop {
                             self.start_verification(task_result);
                         }
                         Err(e) => {
-                            if let Some((uid, guard_hash, is_benchmark)) = self.task_meta.remove(&e.id()) {
-                                warn!(uid = uid, is_benchmark = is_benchmark, "recovering leaked state from panicked task");
+                            if let Some((uid, guard_hash)) = self.task_meta.remove(&e.id()) {
+                                warn!(uid = uid, "recovering leaked state from panicked task");
                                 if let Some(count) = self.miner_active_count.get_mut(&uid) {
                                     *count = count.saturating_sub(1);
-                                }
-                                if is_benchmark {
-                                    self.benchmark_in_flight = self.benchmark_in_flight.saturating_sub(1);
                                 }
                                 if let Some(hash) = &guard_hash {
                                     if !hash.is_empty() {
