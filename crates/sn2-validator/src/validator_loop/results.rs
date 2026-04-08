@@ -1,5 +1,5 @@
 use sn2_types::*;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::{event_slice_num, RetryPayload, ValidatorLoop};
 use crate::incremental_runner::SliceArtifact;
@@ -126,27 +126,32 @@ impl ValidatorLoop {
         reason: &str,
     ) {
         if let Some(run_uid) = run_uid {
+            if !self.run_manager.has_run(run_uid) {
+                return;
+            }
+
             if let Some(snum) = slice_num {
-                let ruid = run_uid.clone();
-                let event_snum = event_slice_num(snum, is_tile, tile_idx);
-                let err = reason.to_string();
-                self.emit_event(move |ev| async move {
-                    ev.emit_slice_failed(&ruid, &event_snum, &err).await;
-                });
+                if !self.run_manager.is_slice_failed(run_uid, snum) {
+                    let ruid = run_uid.clone();
+                    let event_snum = event_slice_num(snum, is_tile, tile_idx);
+                    let err = reason.to_string();
+                    self.emit_event(move |ev| async move {
+                        ev.emit_slice_failed(&ruid, &event_snum, &err).await;
+                    });
+
+                    let failed_count = self.run_manager.mark_slice_failed(run_uid, snum);
+                    warn!(
+                        run_uid = %run_uid,
+                        slice = %snum,
+                        failed_count,
+                        "slice max retries exceeded, continuing run"
+                    );
+                }
             }
-            warn!(run_uid = %run_uid, "dslice max retries exceeded, removing run");
-            if self.run_manager.get_run_source(run_uid) == Some(RunSource::Api) {
-                self.relay_set_request_result(
-                    run_uid,
-                    serde_json::json!({
-                        "run_uid": run_uid,
-                        "status": "failed",
-                        "error": "max retries exceeded",
-                    }),
-                )
-                .await;
+
+            if self.run_manager.is_run_complete(run_uid) {
+                self.finalize_combined_run(run_uid).await;
             }
-            self.teardown_run(run_uid).await;
         }
     }
 
@@ -177,6 +182,15 @@ impl ValidatorLoop {
         }
 
         if !self.run_manager.has_run(&run_uid) {
+            return;
+        }
+
+        if self.run_manager.is_slice_failed(&run_uid, &slice_num) {
+            debug!(
+                run_uid = %run_uid,
+                slice = %slice_num,
+                "ignoring late success for failed slice"
+            );
             return;
         }
 
