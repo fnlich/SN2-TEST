@@ -138,6 +138,11 @@ impl CircuitStore {
         }
 
         info!(count = self.circuits.len(), "circuits loaded");
+
+        if complete {
+            self.purge_stale_cache_dirs(&load_ids);
+        }
+
         Ok(())
     }
 
@@ -222,6 +227,7 @@ impl CircuitStore {
         for id in &removed {
             info!(id = id, "removing deactivated circuit");
             self.circuits.remove(id);
+            self.component_sha_map.retain(|(mid, _), _| mid != id);
         }
 
         Ok(removed)
@@ -850,6 +856,50 @@ impl CircuitStore {
             info!(filename, "downloaded model artifact");
         }
         Ok(())
+    }
+
+    fn purge_stale_cache_dirs(&self, retain_ids: &HashSet<String>) {
+        let entries = match std::fs::read_dir(&self.cache_dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+
+        let downloading = self
+            .inflight_downloads
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+
+        let mut purged = 0usize;
+        for entry in entries.flatten() {
+            let dir_name = entry.file_name().to_string_lossy().to_string();
+            let circuit_id = match dir_name.strip_prefix("model_") {
+                Some(id) if is_sha256_hex(id) => id,
+                _ => continue,
+            };
+
+            if retain_ids.contains(circuit_id) || downloading.contains(circuit_id) {
+                continue;
+            }
+
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    purged += 1;
+                }
+                Err(e) => {
+                    warn!(id = circuit_id, error = %e, "failed to purge stale cache directory");
+                }
+            }
+        }
+
+        if purged > 0 {
+            info!(purged, "purged stale model cache directories");
+        }
     }
 
     fn load_from_cache(&mut self, active_ids: &HashSet<String>) {
