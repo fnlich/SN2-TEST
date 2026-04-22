@@ -9,6 +9,12 @@ use tracing::{info, warn};
 use super::ValidatorLoop;
 use crate::relay::DsperseSubmission;
 
+enum ExpectedInputs {
+    NoMetadata,
+    Count(usize),
+    Invalid,
+}
+
 struct StagedWork {
     requests: VecDeque<DSliceRequest>,
     events: Vec<(String, String, usize)>,
@@ -195,6 +201,33 @@ impl ValidatorLoop {
         }
     }
 
+    fn expected_input_elements(input_shape: &[Vec<i64>]) -> ExpectedInputs {
+        if input_shape.is_empty() {
+            return ExpectedInputs::NoMetadata;
+        }
+        let mut total: usize = 0;
+        for shape in input_shape {
+            let mut product: usize = 1;
+            for &dim in shape {
+                if dim <= 0 {
+                    return ExpectedInputs::Invalid;
+                }
+                let Ok(dim_usize) = usize::try_from(dim) else {
+                    return ExpectedInputs::Invalid;
+                };
+                let Some(next) = product.checked_mul(dim_usize) else {
+                    return ExpectedInputs::Invalid;
+                };
+                product = next;
+            }
+            let Some(next_total) = total.checked_add(product) else {
+                return ExpectedInputs::Invalid;
+            };
+            total = next_total;
+        }
+        ExpectedInputs::Count(total)
+    }
+
     fn flush_staged(&mut self, staged: StagedWork) {
         for request in staged.requests {
             match request.run_source {
@@ -255,6 +288,46 @@ impl ValidatorLoop {
                 }
                 _ => work_items,
             }
+        };
+
+        let work_items: Vec<_> = {
+            let mut kept = Vec::with_capacity(work_items.len());
+            let mut unsatisfiable = 0usize;
+            for work in work_items {
+                match Self::expected_input_elements(&work.slice_meta.input_shape) {
+                    ExpectedInputs::Count(expected) if expected != work.input.len() => {
+                        warn!(
+                            run_uid = %run_uid,
+                            slice = %work.slice_id,
+                            expected,
+                            actual = work.input.len(),
+                            "preflight: slice input activation count does not match circuit expectation, skipping"
+                        );
+                        self.run_manager.mark_slice_failed(run_uid, &work.slice_id);
+                        unsatisfiable += 1;
+                    }
+                    ExpectedInputs::Invalid => {
+                        warn!(
+                            run_uid = %run_uid,
+                            slice = %work.slice_id,
+                            input_shape = ?work.slice_meta.input_shape,
+                            "preflight: slice input shape metadata is invalid (non-positive, overflow, or out-of-range), skipping"
+                        );
+                        self.run_manager.mark_slice_failed(run_uid, &work.slice_id);
+                        unsatisfiable += 1;
+                    }
+                    ExpectedInputs::Count(_) | ExpectedInputs::NoMetadata => kept.push(work),
+                }
+            }
+            if unsatisfiable > 0 {
+                info!(
+                    run_uid = %run_uid,
+                    circuit_id = %circuit.id,
+                    unsatisfiable,
+                    "preflight filtered slices due to mismatched activation sizes or invalid metadata"
+                );
+            }
+            kept
         };
 
         if work_items.is_empty() {
