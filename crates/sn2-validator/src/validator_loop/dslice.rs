@@ -645,17 +645,8 @@ impl ValidatorLoop {
             return None;
         }
 
-        let mut expected_indices: std::collections::HashSet<u32> =
-            std::collections::HashSet::with_capacity(sampled_indices.len());
-        for &idx in &sampled_indices {
-            expected_indices.insert(idx as u32);
-        }
-
-        if let Err(e) = run_manager.init_tile_counter(run_uid, slice_id, tiling, expected_indices) {
-            warn!(run_uid = %run_uid, slice = %slice_id, error = %e, "init_tile_counter failed");
-            return None;
-        }
-
+        let mut prepared: Vec<(usize, serde_json::Value)> =
+            Vec::with_capacity(sampled_indices.len());
         match tiles_payload {
             TiledPayload::SingleInput(tiles) => {
                 for (idx, tile) in tiles.into_iter().enumerate() {
@@ -665,16 +656,7 @@ impl ValidatorLoop {
                     let tile_json = serde_json::json!({
                         "input_data": crate::tensor::arrayd_to_json(&tile.into_dyn())
                     });
-                    staged.stage_request(Self::build_tile_request(
-                        circuit,
-                        slice_id,
-                        run_uid,
-                        tile_json,
-                        idx as u32,
-                        run_source,
-                        circuit_path,
-                        component_sha,
-                    ));
+                    prepared.push((idx, tile_json));
                 }
             }
             TiledPayload::MultiInput(per_tile) => {
@@ -682,39 +664,60 @@ impl ValidatorLoop {
                     if !sampled_indices.contains(&idx) {
                         continue;
                     }
-                    // The 1-D shape `[flat.len()]` always matches the
-                    // length of `flat`, so `from_shape_vec` cannot return
-                    // `Err` here. If it ever does, an upstream invariant
-                    // has been violated and panicking with full context
-                    // is preferable to silently dropping the tile.
                     let len = flat.len();
                     let tile_arr =
-                        ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[len]), flat).unwrap_or_else(
-                            |e| {
-                                panic!(
-                                    "ndarray::ArrayD::from_shape_vec rejected 1-D shape [{len}] \
-                                     for multi-input tile (run_uid={run_uid} slice={slice_id} tile_idx={idx}): {e}"
-                                )
-                            },
-                        );
+                        match ndarray::ArrayD::from_shape_vec(ndarray::IxDyn(&[len]), flat) {
+                            Ok(arr) => arr,
+                            Err(e) => {
+                                warn!(
+                                    run_uid = %run_uid,
+                                    slice = %slice_id,
+                                    tile_idx = idx,
+                                    error = %e,
+                                    "skipping multi-input tile: from_shape_vec rejected 1-D shape"
+                                );
+                                continue;
+                            }
+                        };
                     let tile_json = serde_json::json!({
                         "input_data": crate::tensor::arrayd_to_json(&tile_arr)
                     });
-                    staged.stage_request(Self::build_tile_request(
-                        circuit,
-                        slice_id,
-                        run_uid,
-                        tile_json,
-                        idx as u32,
-                        run_source,
-                        circuit_path,
-                        component_sha,
-                    ));
+                    prepared.push((idx, tile_json));
                 }
             }
         }
 
-        Some(sampled_indices.len())
+        if prepared.is_empty() {
+            warn!(
+                run_uid = %run_uid,
+                slice = %slice_id,
+                "no tiles survived staging, aborting slice"
+            );
+            return None;
+        }
+
+        let expected_indices: std::collections::HashSet<u32> =
+            prepared.iter().map(|(idx, _)| *idx as u32).collect();
+        if let Err(e) = run_manager.init_tile_counter(run_uid, slice_id, tiling, expected_indices) {
+            warn!(run_uid = %run_uid, slice = %slice_id, error = %e, "init_tile_counter failed");
+            return None;
+        }
+
+        let staged_count = prepared.len();
+        for (idx, tile_json) in prepared {
+            staged.stage_request(Self::build_tile_request(
+                circuit,
+                slice_id,
+                run_uid,
+                tile_json,
+                idx as u32,
+                run_source,
+                circuit_path,
+                component_sha,
+            ));
+        }
+
+        Some(staged_count)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -865,10 +868,9 @@ impl ValidatorLoop {
 
         let shape: Vec<usize> = match schema.get("shape").and_then(|v| v.as_array()) {
             Some(dims) => {
-                let flat = if dims.first().and_then(|d| d.as_array()).is_some() {
-                    dims.first().and_then(|d| d.as_array()).unwrap()
-                } else {
-                    dims
+                let flat = match dims.first().and_then(|d| d.as_array()) {
+                    Some(nested) => nested,
+                    None => dims,
                 };
                 match flat
                     .iter()
