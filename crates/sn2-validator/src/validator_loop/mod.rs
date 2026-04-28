@@ -27,6 +27,7 @@ use crate::performance::PerformanceTracker;
 use crate::proof_uploader::ProofUploader;
 use crate::relay::{DsperseSubmission, RelayManager, RwrSubmission};
 use crate::request_pipeline::RequestPipeline;
+use crate::rsv::RsvManager;
 use crate::scoring::ScoreManager;
 use crate::stats_reporter::StatsReporter;
 use sn2_circuit_store::CircuitStore;
@@ -75,6 +76,7 @@ pub(super) struct VerifyResult {
     pub(super) verify_task_id: tokio::task::Id,
     pub(super) task_result: TaskResult,
     pub(super) verified: bool,
+    pub(super) hotkey: String,
 }
 
 pub(super) struct PeriodicTimings {
@@ -158,6 +160,9 @@ pub struct ValidatorLoop {
     pub(super) verification_concurrency: usize,
     pub(super) dslice_input_scales: HashMap<(String, String), f64>,
     pub(super) disabled_slices: HashMap<String, HashSet<String>>,
+    pub(super) rsv: RsvManager,
+    pub(super) current_block: u64,
+    pub(super) blocks_per_tempo: u64,
 }
 
 impl ValidatorLoop {
@@ -183,6 +188,14 @@ impl ValidatorLoop {
             .join("subnet-2")
             .join("performance_tracker.json");
         let performance_tracker = PerformanceTracker::new_with_persistence(perf_path);
+
+        let rsv_path = dirs_next::home_dir()
+            .unwrap_or_default()
+            .join(".bittensor")
+            .join("subnet-2")
+            .join("rsv_state.json");
+        let rsv = RsvManager::new_with_persistence(rsv_path);
+
         let weights_setter = WeightsSetter::new(config.netuid);
 
         let (dsperse_tx, dsperse_rx) = tokio::sync::mpsc::channel::<DsperseSubmission>(256);
@@ -347,6 +360,9 @@ impl ValidatorLoop {
             verification_concurrency,
             dslice_input_scales: HashMap::new(),
             disabled_slices: HashMap::new(),
+            rsv,
+            current_block: 0,
+            blocks_per_tempo: 360,
         })
     }
 
@@ -517,6 +533,7 @@ impl ValidatorLoop {
             error!(error = %e, "saving scores during shutdown");
         }
         self.performance_tracker.save();
+        self.rsv.save();
     }
 }
 

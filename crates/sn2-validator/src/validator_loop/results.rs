@@ -324,6 +324,7 @@ impl ValidatorLoop {
     pub(super) async fn handle_failure(
         &mut self,
         uid: u16,
+        hotkey: &str,
         request_type: RequestType,
         retry_count: u32,
         retry_payload: RetryPayload,
@@ -336,6 +337,20 @@ impl ValidatorLoop {
         reason: &str,
     ) {
         warn!(uid = uid, rtype = %request_type, retry = retry_count, error = reason, "miner query failed");
+
+        let is_verification_failure = reason.starts_with("verification failed")
+            && matches!(
+                request_type,
+                RequestType::ProofOfWeights | RequestType::Rwr | RequestType::DSlice
+            );
+        if is_verification_failure && !hotkey.is_empty() {
+            let triggered =
+                self.rsv
+                    .record_strike(hotkey, self.current_block, self.blocks_per_tempo);
+            if triggered {
+                info!(uid, "rsv: skiplist triggered via failure path");
+            }
+        }
 
         self.performance_tracker.record_reschedule(uid);
 
@@ -362,7 +377,10 @@ impl ValidatorLoop {
 
         let next_retry = retry_count + 1;
 
-        if next_retry <= max_retries && self.attempt_retry(retry_payload, next_retry) {
+        if !is_verification_failure
+            && next_retry <= max_retries
+            && self.attempt_retry(retry_payload, next_retry)
+        {
             return;
         }
 
