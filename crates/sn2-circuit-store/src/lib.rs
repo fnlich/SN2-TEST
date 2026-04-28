@@ -20,22 +20,6 @@ fn is_sha256_hex(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn compute_file_sha256(path: &Path) -> Result<String> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path)
-        .with_context(|| format!("opening {} for sha256", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buf = [0u8; 65536];
-    loop {
-        let n = file.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(hex::encode(hasher.finalize()))
-}
-
 struct WeightRef {
     sha: String,
     filename: String,
@@ -837,16 +821,29 @@ impl CircuitStore {
             }
             if force && dest.exists() {
                 let _ = std::fs::remove_file(&dest);
+                let _ = std::fs::remove_file(Self::sha_stamp_path(&dest));
             }
             if Self::try_hardlink_from_weight_cache(&self.cache_dir, slices_dir, &wb.sha, &dest) {
+                Self::write_weight_sha_stamp(&dest, &wb.sha);
                 continue;
             }
             let url = format!("{}/models/wb/{}", self.api_url, wb.sha);
             self.download_file(&url, &dest)
                 .await
                 .with_context(|| format!("downloading weight blob for {}", comp.name))?;
+            Self::write_weight_sha_stamp(&dest, &wb.sha);
         }
         Ok(())
+    }
+
+    fn sha_stamp_path(dest: &Path) -> PathBuf {
+        let mut p = dest.as_os_str().to_os_string();
+        p.push(".sha");
+        PathBuf::from(p)
+    }
+
+    fn write_weight_sha_stamp(dest: &Path, sha: &str) {
+        let _ = std::fs::write(Self::sha_stamp_path(dest), sha.as_bytes());
     }
 
     /// True when `path` is a `model_<sha256>` directory under the cache root.
@@ -921,8 +918,10 @@ impl CircuitStore {
         false
     }
 
-    /// Scan sibling cached circuits for any weight blob whose contents hash to
-    /// `weight_sha` and hard-link it into place. Returns true on success.
+    /// Scan sibling cached circuits for a weight blob whose `.sha` stamp
+    /// matches `weight_sha` and hard-link it into place. Returns true on
+    /// success. Candidates without a stamp are skipped rather than hashed so
+    /// large payloads do not trigger multi-gigabyte re-reads under contention.
     fn try_hardlink_from_weight_cache(
         cache_dir: &Path,
         current_slices_dir: &Path,
@@ -957,11 +956,20 @@ impl CircuitStore {
                     if !candidate.is_file() {
                         continue;
                     }
-                    let sha = match compute_file_sha256(&candidate) {
-                        Ok(value) => value,
+                    if candidate
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .map(|ext| ext == "sha")
+                        .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    let stamp_path = Self::sha_stamp_path(&candidate);
+                    let recorded = match std::fs::read_to_string(&stamp_path) {
+                        Ok(value) => value.trim().to_string(),
                         Err(_) => continue,
                     };
-                    if sha != weight_sha {
+                    if recorded != weight_sha {
                         continue;
                     }
                     if let Some(parent) = dest.parent() {
