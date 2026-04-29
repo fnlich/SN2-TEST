@@ -1,18 +1,22 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use base64::Engine;
 use sn2_chain::Wallet;
 use sn2_types::{MinerResponse, DEFAULT_API_URL, SOFTWARE_VERSION};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
+
+use crate::performance::{CapDirection, CapEvent};
 pub(crate) const STATS_FLUSH_INTERVAL_SECS: u64 = 60;
 const REQUEST_TIMEOUT_SECS: u64 = 5;
+const PENDING_CAP_EVENTS_MAX: usize = 4096;
 
 pub(crate) enum FlushOffset {
     ResponseLog = 0,
     Health = 20,
     DsperseEvents = 40,
+    Capacity = 50,
 }
 const MAX_RETRIES: u32 = 3;
 const BACKOFF_BASE_MS: u64 = 500;
@@ -26,6 +30,8 @@ pub struct StatsReporter {
     last_response_log: Instant,
     health_samples: Vec<HealthSample>,
     last_health_flush: Instant,
+    last_capacity_flush: Instant,
+    pending_cap_events: Arc<Mutex<VecDeque<CapEvent>>>,
     validator_uid: u16,
 }
 
@@ -59,10 +65,15 @@ pub struct DsperseSliceReport {
 impl StatsReporter {
     pub fn new(wallet: Arc<Wallet>, api_base_url: Option<String>, validator_uid: u16) -> Self {
         let now = Instant::now();
-        let response_offset =
-            Duration::from_secs(STATS_FLUSH_INTERVAL_SECS - FlushOffset::ResponseLog as u64);
-        let health_offset =
-            Duration::from_secs(STATS_FLUSH_INTERVAL_SECS - FlushOffset::Health as u64);
+        let response_offset = Duration::from_secs(
+            STATS_FLUSH_INTERVAL_SECS.saturating_sub(FlushOffset::ResponseLog as u64),
+        );
+        let health_offset = Duration::from_secs(
+            STATS_FLUSH_INTERVAL_SECS.saturating_sub(FlushOffset::Health as u64),
+        );
+        let capacity_offset = Duration::from_secs(
+            STATS_FLUSH_INTERVAL_SECS.saturating_sub(FlushOffset::Capacity as u64),
+        );
         Self {
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
@@ -74,6 +85,8 @@ impl StatsReporter {
             last_response_log: now - response_offset,
             health_samples: Vec::new(),
             last_health_flush: now - health_offset,
+            last_capacity_flush: now - capacity_offset,
+            pending_cap_events: Arc::new(Mutex::new(VecDeque::new())),
             validator_uid,
         }
     }
@@ -197,6 +210,109 @@ impl StatsReporter {
         self.spawn_post("/statistics/health/log/", body, |_| {});
     }
 
+    pub fn capacity_flush_due(&self) -> bool {
+        Instant::now().duration_since(self.last_capacity_flush)
+            >= Duration::from_secs(STATS_FLUSH_INTERVAL_SECS)
+    }
+
+    pub fn flush_capacity(
+        &mut self,
+        block: u64,
+        snapshot: HashMap<u16, usize>,
+        new_events: Vec<CapEvent>,
+        uid_hotkeys: &HashMap<u16, String>,
+    ) {
+        let now = Instant::now();
+        if now.duration_since(self.last_capacity_flush)
+            < Duration::from_secs(STATS_FLUSH_INTERVAL_SECS)
+        {
+            // Caller drained the tracker but the rate-limit window has not
+            // elapsed; persist the events so the next flush picks them up
+            // instead of dropping a discrete state transition on the floor.
+            requeue_cap_events(
+                &self.pending_cap_events,
+                new_events,
+                RequeueReason::RateLimited,
+            );
+            return;
+        }
+
+        let mut events: Vec<CapEvent> = {
+            let mut pending = match self.pending_cap_events.lock() {
+                Ok(g) => g,
+                Err(poisoned) => {
+                    warn!(error = %poisoned, "cap event pending lock poisoned, recovering");
+                    poisoned.into_inner()
+                }
+            };
+            let mut combined: Vec<CapEvent> = pending.drain(..).collect();
+            combined.extend(new_events);
+            combined
+        };
+
+        if snapshot.is_empty() && events.is_empty() {
+            return;
+        }
+        self.last_capacity_flush = now;
+
+        let snapshots_payload: Vec<serde_json::Value> = snapshot
+            .into_iter()
+            .map(|(uid, cap)| {
+                serde_json::json!({
+                    "miner_uid": uid,
+                    "miner_key": uid_hotkeys.get(&uid).cloned().unwrap_or_default(),
+                    "cap": cap,
+                })
+            })
+            .collect();
+
+        let events_payload: Vec<serde_json::Value> = events
+            .iter()
+            .map(|e| {
+                let direction = match e.direction {
+                    CapDirection::Ramp => "ramp",
+                    CapDirection::Backoff => "backoff",
+                };
+                let elapsed_ms = now.saturating_duration_since(e.at).as_millis() as u64;
+                serde_json::json!({
+                    "miner_uid": e.uid,
+                    "miner_key": e.hotkey,
+                    "direction": direction,
+                    "cap_from": e.cap_from,
+                    "cap_to": e.cap_to,
+                    "success_rate": e.success_rate,
+                    "elapsed_ms": elapsed_ms,
+                })
+            })
+            .collect();
+
+        let snapshot_count = snapshots_payload.len();
+        let event_count = events_payload.len();
+        let body = serde_json::json!({
+            "validator_key": self.wallet.hotkey_ss58(),
+            "validator_uid": self.validator_uid,
+            "block": block,
+            "snapshots": snapshots_payload,
+            "events": events_payload,
+            "software_version": SOFTWARE_VERSION,
+        });
+
+        let pending = Arc::clone(&self.pending_cap_events);
+        events.shrink_to_fit();
+        let inflight = std::mem::take(&mut events);
+        self.spawn_post("/statistics/capacity/log/", body, move |ok| {
+            if ok {
+                info!(
+                    snapshots = snapshot_count,
+                    events = event_count,
+                    "submitted capacity stats"
+                );
+            } else {
+                requeue_cap_events(&pending, inflight, RequeueReason::PostFailure);
+            }
+        });
+    }
+
     pub fn report_dsperse_run(&self, report: DsperseRunReport) {
         let slices: Vec<serde_json::Value> = report
             .slices
@@ -260,6 +376,49 @@ impl StatsReporter {
         tokio::spawn(async move {
             on_done(sign_and_post(&http, &wallet, &url, &body, &path_owned).await);
         });
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum RequeueReason {
+    PostFailure,
+    RateLimited,
+}
+
+fn requeue_cap_events(
+    pending: &Mutex<VecDeque<CapEvent>>,
+    events: Vec<CapEvent>,
+    reason: RequeueReason,
+) {
+    if events.is_empty() {
+        return;
+    }
+    let mut p = match pending.lock() {
+        Ok(g) => g,
+        Err(poisoned) => {
+            warn!(error = %poisoned, "cap event re-queue lock poisoned, recovering");
+            poisoned.into_inner()
+        }
+    };
+    let count = events.len();
+    for e in events {
+        p.push_back(e);
+    }
+    while p.len() > PENDING_CAP_EVENTS_MAX {
+        p.pop_front();
+    }
+    let pending_len = p.len();
+    match reason {
+        RequeueReason::PostFailure => warn!(
+            count,
+            pending = pending_len,
+            "cap event POST failed, re-queued for next flush"
+        ),
+        RequeueReason::RateLimited => debug!(
+            count,
+            pending = pending_len,
+            "cap event flush deferred by rate limit, re-queued"
+        ),
     }
 }
 
@@ -477,5 +636,70 @@ fn get_rss_mb() -> f64 {
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         0.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::performance::CapDirection;
+
+    fn ev(uid: u16, hotkey: &str) -> CapEvent {
+        CapEvent {
+            uid,
+            hotkey: hotkey.to_string(),
+            direction: CapDirection::Ramp,
+            cap_from: 1,
+            cap_to: 2,
+            success_rate: 1.0,
+            at: Instant::now(),
+        }
+    }
+
+    #[test]
+    fn requeue_preserves_order() {
+        let pending = Mutex::new(VecDeque::new());
+        let batch = vec![ev(1, "a"), ev(2, "b"), ev(3, "c")];
+        requeue_cap_events(&pending, batch, RequeueReason::PostFailure);
+        let p = pending.lock().unwrap();
+        assert_eq!(p.len(), 3);
+        assert_eq!(p[0].uid, 1);
+        assert_eq!(p[1].uid, 2);
+        assert_eq!(p[2].uid, 3);
+    }
+
+    #[test]
+    fn requeue_appends_so_older_failures_drain_first() {
+        let pending = Mutex::new(VecDeque::new());
+        requeue_cap_events(&pending, vec![ev(10, "a")], RequeueReason::PostFailure);
+        requeue_cap_events(&pending, vec![ev(11, "b")], RequeueReason::PostFailure);
+        let p = pending.lock().unwrap();
+        assert_eq!(p[0].uid, 10, "earlier failure stays at the front");
+        assert_eq!(p[1].uid, 11);
+    }
+
+    #[test]
+    fn requeue_drops_oldest_when_buffer_full() {
+        let pending = Mutex::new(VecDeque::new());
+        let total = PENDING_CAP_EVENTS_MAX + 50;
+        let big: Vec<CapEvent> = (0..total).map(|i| ev(i as u16, "a")).collect();
+        requeue_cap_events(&pending, big, RequeueReason::PostFailure);
+        let p = pending.lock().unwrap();
+        assert_eq!(p.len(), PENDING_CAP_EVENTS_MAX);
+        let actual: Vec<u16> = p.iter().map(|e| e.uid).collect();
+        let expected: Vec<u16> = ((total - PENDING_CAP_EVENTS_MAX)..total)
+            .map(|i| i as u16)
+            .collect();
+        assert_eq!(
+            actual, expected,
+            "buffer should retain the most recent PENDING_CAP_EVENTS_MAX entries in original order"
+        );
+    }
+
+    #[test]
+    fn requeue_no_op_on_empty_input() {
+        let pending = Mutex::new(VecDeque::new());
+        requeue_cap_events(&pending, Vec::new(), RequeueReason::PostFailure);
+        assert!(pending.lock().unwrap().is_empty());
     }
 }

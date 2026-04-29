@@ -12,10 +12,30 @@ use tracing::warn;
 
 type WindowEntry = (Instant, bool, f64);
 
+const MAX_BUFFERED_CAP_EVENTS: usize = 4096;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapDirection {
+    Ramp,
+    Backoff,
+}
+
+#[derive(Clone, Debug)]
+pub struct CapEvent {
+    pub uid: u16,
+    pub hotkey: String,
+    pub direction: CapDirection,
+    pub cap_from: usize,
+    pub cap_to: usize,
+    pub success_rate: f64,
+    pub at: Instant,
+}
+
 pub struct PerformanceTracker {
     windows: HashMap<u16, VecDeque<WindowEntry>>,
     adaptive_caps: HashMap<u16, usize>,
     at_cap_results: HashMap<u16, VecDeque<bool>>,
+    cap_events: Vec<CapEvent>,
     persistence_path: Option<PathBuf>,
 }
 
@@ -40,19 +60,35 @@ impl PerformanceTracker {
             windows: HashMap::new(),
             adaptive_caps: HashMap::new(),
             at_cap_results: HashMap::new(),
+            cap_events: Vec::new(),
             persistence_path: Some(path),
         };
         tracker.load();
         tracker
     }
 
-    pub fn record(&mut self, uid: u16, success: bool, response_time: f64, was_at_capacity: bool) {
-        self.record_with_time(uid, success, response_time, was_at_capacity, Instant::now());
+    pub fn record(
+        &mut self,
+        uid: u16,
+        hotkey: &str,
+        success: bool,
+        response_time: f64,
+        was_at_capacity: bool,
+    ) {
+        self.record_with_time(
+            uid,
+            hotkey,
+            success,
+            response_time,
+            was_at_capacity,
+            Instant::now(),
+        );
     }
 
     pub fn record_with_time(
         &mut self,
         uid: u16,
+        hotkey: &str,
         success: bool,
         response_time: f64,
         was_at_capacity: bool,
@@ -68,7 +104,7 @@ impl PerformanceTracker {
             if results.len() > CAPACITY_WINDOW_SIZE {
                 results.pop_front();
             }
-            self.update_adaptive_cap(uid);
+            self.update_adaptive_cap(uid, hotkey);
         }
     }
 
@@ -327,13 +363,14 @@ impl PerformanceTracker {
         (total / w.len() as f64).max(0.0)
     }
 
-    pub fn reset_uid(&mut self, uid: u16) {
+    pub fn reset_uid(&mut self, uid: u16, hotkey: &str) {
         self.windows.remove(&uid);
         self.adaptive_caps.remove(&uid);
         self.at_cap_results.remove(&uid);
+        self.cap_events.retain(|e| e.hotkey != hotkey);
     }
 
-    fn update_adaptive_cap(&mut self, uid: u16) {
+    fn update_adaptive_cap(&mut self, uid: u16, hotkey: &str) {
         let success_rate = match self.at_cap_results.get(&uid) {
             Some(r) if r.len() >= CAPACITY_MIN_AT_CAP => {
                 r.iter().filter(|&&s| s).count() as f64 / r.len() as f64
@@ -342,18 +379,47 @@ impl PerformanceTracker {
         };
 
         let current = self.adaptive_caps.entry(uid).or_insert(1);
+        let cap_from = *current;
+        let mut direction: Option<CapDirection> = None;
 
         if success_rate >= CAPACITY_RAMP_THRESHOLD {
             *current += 1;
+            direction = Some(CapDirection::Ramp);
             if let Some(r) = self.at_cap_results.get_mut(&uid) {
                 r.clear();
             }
         } else if success_rate < CAPACITY_BACKOFF_THRESHOLD && *current > 1 {
             *current -= 1;
+            direction = Some(CapDirection::Backoff);
             if let Some(r) = self.at_cap_results.get_mut(&uid) {
                 r.clear();
             }
         }
+
+        if let Some(direction) = direction {
+            let cap_to = *current;
+            self.cap_events.push(CapEvent {
+                uid,
+                hotkey: hotkey.to_string(),
+                direction,
+                cap_from,
+                cap_to,
+                success_rate,
+                at: Instant::now(),
+            });
+            if self.cap_events.len() > MAX_BUFFERED_CAP_EVENTS {
+                let drop = self.cap_events.len() - MAX_BUFFERED_CAP_EVENTS;
+                self.cap_events.drain(0..drop);
+            }
+        }
+    }
+
+    pub fn cap_snapshot(&self) -> HashMap<u16, usize> {
+        self.adaptive_caps.clone()
+    }
+
+    pub fn drain_cap_events(&mut self) -> Vec<CapEvent> {
+        std::mem::take(&mut self.cap_events)
     }
 }
 
@@ -366,6 +432,7 @@ mod tests {
             windows: HashMap::new(),
             adaptive_caps: HashMap::new(),
             at_cap_results: HashMap::new(),
+            cap_events: Vec::new(),
             persistence_path: None,
         }
     }
@@ -379,8 +446,8 @@ mod tests {
     #[test]
     fn record_populates_window() {
         let mut tracker = test_tracker();
-        tracker.record(1, true, 5.0, false);
-        tracker.record(1, true, 6.0, false);
+        tracker.record(1, "hk", true, 5.0, false);
+        tracker.record(1, "hk", true, 6.0, false);
         assert_eq!(tracker.windows.get(&1).unwrap().len(), 2);
     }
 
@@ -398,9 +465,9 @@ mod tests {
     #[test]
     fn reset_uid_clears_all_state() {
         let mut tracker = test_tracker();
-        tracker.record(1, true, 5.0, true);
+        tracker.record(1, "hk", true, 5.0, true);
         tracker.adaptive_caps.insert(1, 4);
-        tracker.reset_uid(1);
+        tracker.reset_uid(1, "hk");
         assert!(!tracker.windows.contains_key(&1));
         assert!(!tracker.adaptive_caps.contains_key(&1));
         assert!(!tracker.at_cap_results.contains_key(&1));
@@ -410,7 +477,7 @@ mod tests {
     fn adaptive_timeout_calculates_percentile_and_clamps() {
         let mut tracker = test_tracker();
         for i in 0..ADAPTIVE_TIMEOUT_MIN_SAMPLES {
-            tracker.record(1, true, (i + 1) as f64, false);
+            tracker.record(1, "hk", true, (i + 1) as f64, false);
         }
         let timeout = tracker.adaptive_timeout();
         let mut sorted: Vec<f64> = (1..=ADAPTIVE_TIMEOUT_MIN_SAMPLES)
@@ -428,7 +495,7 @@ mod tests {
 
         let mut tracker2 = test_tracker();
         for _ in 0..ADAPTIVE_TIMEOUT_MIN_SAMPLES {
-            tracker2.record(1, true, 500.0, false);
+            tracker2.record(1, "hk", true, 500.0, false);
         }
         assert_eq!(
             tracker2.adaptive_timeout(),
@@ -440,7 +507,7 @@ mod tests {
     #[test]
     fn miner_capacities_default_to_one() {
         let mut tracker = test_tracker();
-        tracker.record(1, true, 5.0, false);
+        tracker.record(1, "hk", true, 5.0, false);
         let caps = tracker.miner_capacities();
         assert_eq!(caps.get(&1).copied().unwrap_or(0), 1);
     }
@@ -452,10 +519,94 @@ mod tests {
         let stale = now
             .checked_sub(window_ttl() + Duration::from_secs(60))
             .expect("Instant arithmetic");
-        tracker.record_with_time(1, true, 5.0, false, stale);
-        tracker.record_with_time(1, true, 6.0, false, now);
+        tracker.record_with_time(1, "hk", true, 5.0, false, stale);
+        tracker.record_with_time(1, "hk", true, 6.0, false, now);
         let window = tracker.windows.get(&1).unwrap();
         assert_eq!(window.len(), 1);
         assert_eq!(window[0].2, 6.0);
+    }
+
+    #[test]
+    fn cap_ramp_emits_event_with_from_to_and_rate() {
+        let mut tracker = test_tracker();
+        for _ in 0..CAPACITY_MIN_AT_CAP {
+            tracker.record(1, "hk", true, 1.0, true);
+        }
+        let events = tracker.drain_cap_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].direction, CapDirection::Ramp);
+        assert_eq!(events[0].cap_from, 1);
+        assert_eq!(events[0].cap_to, 2);
+        assert!((events[0].success_rate - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn cap_backoff_emits_event_when_already_above_one() {
+        let mut tracker = test_tracker();
+        for _ in 0..CAPACITY_MIN_AT_CAP {
+            tracker.record(1, "hk", true, 1.0, true);
+        }
+        tracker.cap_events.clear();
+        for _ in 0..CAPACITY_MIN_AT_CAP {
+            tracker.record(1, "hk", false, 1.0, true);
+        }
+        let events = tracker.drain_cap_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].direction, CapDirection::Backoff);
+        assert_eq!(events[0].cap_from, 2);
+        assert_eq!(events[0].cap_to, 1);
+    }
+
+    #[test]
+    fn drain_cap_events_clears_buffer() {
+        let mut tracker = test_tracker();
+        for _ in 0..CAPACITY_MIN_AT_CAP {
+            tracker.record(1, "hk", true, 1.0, true);
+        }
+        assert_eq!(tracker.drain_cap_events().len(), 1);
+        assert!(tracker.drain_cap_events().is_empty());
+    }
+
+    #[test]
+    fn cap_event_buffer_is_bounded() {
+        let mut tracker = test_tracker();
+        for _ in 0..(MAX_BUFFERED_CAP_EVENTS + 50) {
+            for _ in 0..CAPACITY_MIN_AT_CAP {
+                tracker.record(1, "hk", true, 1.0, true);
+            }
+        }
+        assert!(tracker.cap_events.len() <= MAX_BUFFERED_CAP_EVENTS);
+    }
+
+    #[test]
+    fn reset_uid_purges_buffered_cap_events_for_that_hotkey() {
+        let mut tracker = test_tracker();
+        for _ in 0..CAPACITY_MIN_AT_CAP {
+            tracker.record(1, "hk_a", true, 1.0, true);
+        }
+        for _ in 0..CAPACITY_MIN_AT_CAP {
+            tracker.record(2, "hk_b", true, 1.0, true);
+        }
+        assert_eq!(tracker.cap_events.len(), 2);
+        tracker.reset_uid(1, "hk_a");
+        let remaining = tracker.drain_cap_events();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].hotkey, "hk_b");
+    }
+
+    #[test]
+    fn reset_uid_purge_is_keyed_by_hotkey_not_uid_slot() {
+        let mut tracker = test_tracker();
+        for _ in 0..CAPACITY_MIN_AT_CAP {
+            tracker.record(1, "hk_old", true, 1.0, true);
+        }
+        for _ in 0..CAPACITY_MIN_AT_CAP {
+            tracker.record(1, "hk_new", true, 1.0, true);
+        }
+        assert_eq!(tracker.cap_events.len(), 2);
+        tracker.reset_uid(1, "hk_old");
+        let remaining = tracker.drain_cap_events();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].hotkey, "hk_new");
     }
 }
