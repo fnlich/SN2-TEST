@@ -117,7 +117,7 @@ pub(super) struct DispatchedRequest {
     pub(super) is_tile: bool,
     pub(super) task_id: Option<String>,
     pub(super) tile_idx: Option<u32>,
-    pub(super) task_circuit: Option<Circuit>,
+    pub(super) task_circuit: Option<std::sync::Arc<Circuit>>,
     pub(super) task_inputs: Option<serde_json::Value>,
     pub(super) task_proof_system: Option<ProofSystem>,
     pub(super) retry_payload: RetryPayload,
@@ -164,6 +164,7 @@ pub struct ValidatorLoop {
     pub(super) current_block: u64,
     pub(super) blocks_per_tempo: u64,
     pub(super) consecutive_metagraph_failures: u32,
+    pub(super) dispatch_cache: dispatch::DispatchCache,
 }
 
 pub(super) const METAGRAPH_FAILURE_RECONNECT_THRESHOLD: u32 = 3;
@@ -367,6 +368,7 @@ impl ValidatorLoop {
             current_block: 0,
             blocks_per_tempo: 360,
             consecutive_metagraph_failures: 0,
+            dispatch_cache: dispatch::DispatchCache::new(),
         })
     }
 
