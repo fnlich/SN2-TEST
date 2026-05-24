@@ -5,7 +5,7 @@ mod relay;
 mod results;
 mod verification;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -65,6 +65,10 @@ pub(super) struct TaskResult {
     pub(super) tile_idx: Option<u32>,
     pub(super) outcome: TaskOutcome,
     pub(super) retry_payload: RetryPayload,
+    // Pre-decided RSV sample disposition. When false, validator never
+    // intended to deep-verify this request, so input/proof bytes may have
+    // been dropped before the response was received.
+    pub(super) pre_sampled: bool,
 }
 
 pub(super) enum TaskOutcome {
@@ -123,6 +127,10 @@ pub(super) struct DispatchedRequest {
     pub(super) retry_payload: RetryPayload,
     pub(super) dsperse_circuit_path: Option<String>,
     pub(super) component_sha: Option<String>,
+    // Pre-rolled RSV sample decision attached at dispatch time. When false,
+    // task_inputs is cleared before the miner task is spawned to avoid
+    // retaining the validator's local input copy across the in-flight window.
+    pub(super) pre_sampled: bool,
 }
 
 pub struct ValidatorLoop {
@@ -159,7 +167,13 @@ pub struct ValidatorLoop {
     pub(super) pending_verifications: VecDeque<(TaskResult, bool)>,
     pub(super) verification_concurrency: usize,
     pub(super) dslice_input_scales: HashMap<(String, String), f64>,
-    pub(super) disabled_slices: HashMap<String, HashSet<String>>,
+    // Slices observed to fail across a full benchmark run with zero verified
+    // tiles. Inner map is slice_id -> block_height at disable time so entries
+    // can age out via prune_disabled_slices() once the validator recovers
+    // from a transient network or chain event. Without an age, a single
+    // network-wide reconnect storm leaves slices permanently skipped until
+    // restart.
+    pub(super) disabled_slices: HashMap<String, HashMap<String, u64>>,
     pub(super) rsv: RsvManager,
     pub(super) current_block: u64,
     pub(super) blocks_per_tempo: u64,

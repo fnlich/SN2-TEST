@@ -18,14 +18,7 @@ impl ValidatorLoop {
         // until spawn_verification means pending_verifications buffers the
         // full proof payload across the verify-CPU bottleneck for ~95% of
         // responses that take the RSV fast path without needing them.
-        let hotkey = self.uid_hotkeys.get(&uid).cloned().unwrap_or_default();
-        let sample = decide_sample(
-            &result,
-            &hotkey,
-            self.current_block,
-            self.blocks_per_tempo,
-            &mut self.rsv,
-        );
+        let sample = decide_sample(&result);
         if !sample && !response_needs_proof_bytes_for_downstream(&result) {
             if let TaskOutcome::Success(ref mut response) = result.outcome {
                 response.proof_content = None;
@@ -33,6 +26,12 @@ impl ValidatorLoop {
                 response.witness = None;
                 response.raw = None;
                 response.public_json = None;
+                // Also release the validator's local input copy. Pre-sampling
+                // at dispatch already drops most of these before the task is
+                // spawned, but the audit-eligible path still allocates inputs
+                // and this branch lets force-verify-then-no-verify edge cases
+                // (e.g. empty proof on a force_verify request) reclaim them.
+                response.inputs = None;
             }
         }
 
@@ -247,22 +246,40 @@ impl ValidatorLoop {
     }
 }
 
-fn decide_sample(
-    result: &TaskResult,
+fn decide_sample(result: &TaskResult) -> bool {
+    let has_proof = matches!(result.outcome, TaskOutcome::Success(ref r) if r.proof_size > 0);
+    if !has_proof {
+        return false;
+    }
+    // The pre-decision attached at dispatch is authoritative. The historical
+    // empty-hotkey force-sample branch was a safety net for the RSV roll
+    // that used to run here, but it has migrated to pre_decide_sample at
+    // dispatch time. Re-checking hotkey state at verify time would let a
+    // post-dispatch metagraph reshuffle (uid deregistered between dispatch
+    // and response) revive sampling on a request whose task_inputs were
+    // already released, leading to a verification attempt against a missing
+    // input tensor. pre_sampled alone is the correct signal here.
+    result.pre_sampled
+}
+
+/// Dispatch-time mirror of decide_sample. Runs before the miner task is
+/// spawned so the validator can drop its local copy of task_inputs (and any
+/// other per-request state that would only be needed for deep verification)
+/// for the ~96% of dispatches that take the RSV fast path. Empty hotkey is
+/// preserved as a force-verify case to keep parity with the response-side
+/// decision in case the metagraph is mid-sync at dispatch time.
+pub(super) fn pre_decide_sample(
+    dispatched: &super::DispatchedRequest,
     hotkey: &str,
     current_block: u64,
     blocks_per_tempo: u64,
     rsv: &mut crate::rsv::RsvManager,
 ) -> bool {
-    let has_proof = matches!(result.outcome, TaskOutcome::Success(ref r) if r.proof_size > 0);
-    if !has_proof {
-        return false;
-    }
-    let is_pow = result.request_type == RequestType::ProofOfWeights;
-    let is_customer_rwr = result.request_type == RequestType::Rwr;
-    let has_external_hash = result.external_request_hash.is_some();
+    let is_pow = dispatched.request_type == RequestType::ProofOfWeights;
+    let is_customer_rwr = dispatched.request_type == RequestType::Rwr;
+    let has_external_hash = dispatched.external_request_hash.is_some();
     let is_api_dslice = matches!(
-        &result.retry_payload,
+        &dispatched.retry_payload,
         RetryPayload::DSlice(d) if d.run_source == RunSource::Api
     );
     let force_verify = is_pow || is_customer_rwr || has_external_hash || is_api_dslice;
