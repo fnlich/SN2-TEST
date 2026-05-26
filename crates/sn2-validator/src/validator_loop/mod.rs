@@ -77,7 +77,7 @@ pub(super) enum TaskOutcome {
 }
 
 pub(super) struct VerifyResult {
-    pub(super) verify_task_id: tokio::task::Id,
+    pub(super) verify_task_id: Option<tokio::task::Id>,
     pub(super) task_result: TaskResult,
     pub(super) verified: bool,
     pub(super) hotkey: String,
@@ -92,6 +92,7 @@ pub(super) struct PeriodicTimings {
     pub(super) health_log: Instant,
     pub(super) replenish: Instant,
     pub(super) gc: Instant,
+    pub(super) cooldown_prune: Instant,
 }
 
 impl PeriodicTimings {
@@ -105,6 +106,7 @@ impl PeriodicTimings {
             health_log: now,
             replenish: now,
             gc: now,
+            cooldown_prune: now,
         }
     }
 }
@@ -179,7 +181,7 @@ pub struct ValidatorLoop {
     pub(super) blocks_per_tempo: u64,
     pub(super) consecutive_metagraph_failures: u32,
     pub(super) dispatch_cache: dispatch::DispatchCache,
-    pub(super) reconnect_blacklist: HashMap<String, u64>,
+    pub(super) dispatch_cooldowns: HashMap<String, u64>,
 }
 
 pub(super) const METAGRAPH_FAILURE_RECONNECT_THRESHOLD: u32 = 3;
@@ -388,7 +390,7 @@ impl ValidatorLoop {
             blocks_per_tempo: 360,
             consecutive_metagraph_failures: 0,
             dispatch_cache: dispatch::DispatchCache::new(),
-            reconnect_blacklist: HashMap::new(),
+            dispatch_cooldowns: HashMap::new(),
         })
     }
 
@@ -449,7 +451,7 @@ impl ValidatorLoop {
                     match result {
                         Ok(task_result) => {
                             self.task_meta.remove(&task_result.tokio_task_id);
-                            self.start_verification(task_result);
+                            self.start_verification(task_result).await;
                         }
                         Err(e) => {
                             if let Some((uid, guard_hash)) = self.task_meta.remove(&e.id()) {
@@ -471,8 +473,11 @@ impl ValidatorLoop {
                 Some(result) = self.verify_tasks.join_next() => {
                     match result {
                         Ok(verify_result) => {
-                            let guard_hash = self.verify_guard_hashes.remove(&verify_result.verify_task_id);
-                            self.finish_verification(verify_result, guard_hash.flatten()).await;
+                            let guard_hash = verify_result
+                                .verify_task_id
+                                .and_then(|id| self.verify_guard_hashes.remove(&id))
+                                .flatten();
+                            self.finish_verification(verify_result, guard_hash).await;
                         }
                         Err(e) => {
                             if let Some(Some(hash)) = self.verify_guard_hashes.remove(&e.id()) {
