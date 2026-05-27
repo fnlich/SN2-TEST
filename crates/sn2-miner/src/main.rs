@@ -7,7 +7,9 @@ mod lightning_server;
 mod nftables;
 mod roster;
 
+use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
@@ -87,19 +89,16 @@ async fn main() -> Result<()> {
 
     let metagraph = Arc::new(RwLock::new(metagraph));
 
-    let external_ip: std::net::IpAddr = match cli.external_ip.as_deref() {
-        Some(ip) => ip.parse().context("parsing external IP")?,
-        None => {
-            let resp = reqwest::get("https://api.ipify.org")
-                .await
-                .context("detecting external IP")?
-                .text()
-                .await
-                .context("reading external IP response")?;
-            resp.trim()
-                .parse()
-                .with_context(|| format!("parsing detected IP: {resp}"))?
+    let external_ip = match resolve_external_ip(cli.external_ip.as_deref()).await {
+        Ok(ip) => Some(ip),
+        Err(e) if cli.external_ip.is_none() => {
+            warn!(
+                error = ?e,
+                "external IP autodetection failed; skipping serve_axon for this boot"
+            );
+            None
         }
+        Err(e) => return Err(e),
     };
 
     let quic_port = cli.axon_port;
@@ -162,13 +161,15 @@ async fn main() -> Result<()> {
         })
     };
 
-    match registration
-        .serve_axon(&chain_client, &wallet, external_ip, quic_port, 4)
-        .await
-    {
-        Ok(()) => {}
-        Err(e) => {
-            warn!(error = %e, "serve_axon failed (rate-limited or transient); miner will continue");
+    if let Some(external_ip) = external_ip {
+        match registration
+            .serve_axon(&chain_client, &wallet, external_ip, quic_port, 4)
+            .await
+        {
+            Ok(()) => {}
+            Err(e) => {
+                warn!(error = %e, "serve_axon failed (rate-limited or transient); miner will continue");
+            }
         }
     }
 
@@ -307,6 +308,41 @@ async fn run_loopback(cli: Cli) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn resolve_external_ip(override_ip: Option<&str>) -> Result<IpAddr> {
+    if let Some(ip) = override_ip {
+        let parsed: IpAddr = ip.parse().context("parsing --external-ip")?;
+        return require_ipv4(parsed);
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("building HTTP client for external-IP detection")?;
+    let resp = client
+        .get("https://api4.ipify.org")
+        .send()
+        .await
+        .context("detecting external IP via api4.ipify.org")?
+        .text()
+        .await
+        .context("reading external IP response body")?;
+    let parsed: IpAddr = resp
+        .trim()
+        .parse()
+        .with_context(|| format!("parsing detected IP: {resp}"))?;
+    require_ipv4(parsed)
+}
+
+fn require_ipv4(ip: IpAddr) -> Result<IpAddr> {
+    match ip {
+        IpAddr::V4(_) => Ok(ip),
+        IpAddr::V6(_) => {
+            anyhow::bail!(
+                "external IP must be IPv4 (axon registration does not support IPv6): {ip}"
+            )
+        }
+    }
 }
 
 async fn init_circuit_store(
