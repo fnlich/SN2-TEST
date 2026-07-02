@@ -5,9 +5,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use sn2_types::{
     ADAPTIVE_TIMEOUT_MIN_SAMPLES, ADAPTIVE_TIMEOUT_MULTIPLIER, ADAPTIVE_TIMEOUT_PERCENTILE,
     BLOCK_TIME_SECS, CAPACITY_BACKOFF_THRESHOLD, CAPACITY_MIN_AT_CAP,
-    CAPACITY_RAMP_MIN_AVAIL_MEM_RATIO, CAPACITY_RAMP_THRESHOLD, CAPACITY_WINDOW_SIZE,
-    CIRCUIT_TIMEOUT_SECONDS, PERFORMANCE_MIN_SAMPLES, PERFORMANCE_RESCHEDULE_PENALTY,
-    PERFORMANCE_SCORING_PERCENTILE, VERIFICATION_WINDOW_BLOCKS,
+    CAPACITY_RAMP_MIN_AVAIL_MEM_RATIO, CAPACITY_RAMP_THRESHOLD, CAPACITY_SATURATION_TOLERANCE,
+    CAPACITY_UNIT_REFERENCE_PERCENTILE, CAPACITY_WINDOW_SIZE, CIRCUIT_TIMEOUT_SECONDS,
+    DELIVERED_WORK_BUCKET_SECS, FAILURE_DEBIT_MULTIPLIER, PERFORMANCE_MIN_SAMPLES,
+    PERFORMANCE_RESCHEDULE_PENALTY, PERFORMANCE_WINDOW_SIZE, VERIFICATION_WINDOW_BLOCKS,
 };
 use tracing::{debug, warn};
 
@@ -75,10 +76,26 @@ pub struct PerformanceTracker {
     cap_events: Vec<CapEvent>,
     pending_evictions: Vec<(u16, String)>,
     at_cap_last_touched: HashMap<u16, Instant>,
+    unit_times: HashMap<String, VecDeque<(Instant, f64)>>,
+    unit_reference_cache: HashMap<String, (u64, f64)>,
+    rel_speed: HashMap<u16, VecDeque<(Instant, f64)>>,
+    unit_own_best: HashMap<u16, HashMap<String, (Instant, f64)>>,
+    miner_slowdown: HashMap<u16, VecDeque<(Instant, f64)>>,
+    delivered_work: HashMap<u16, VecDeque<(Instant, f64)>>,
+    total_records: u64,
     persistence_path: Option<PathBuf>,
 }
 
 const CAP_DECAY_IDLE_SECS: u64 = 600;
+
+const UNIT_REFERENCE_REFRESH_RECORDS: u64 = 64;
+const UNIT_TIMES_CAP: usize = 256;
+const UNIT_REFERENCE_MIN_SAMPLES: usize = 8;
+const REL_SPEED_WINDOW: usize = 64;
+
+const SLOWDOWN_WINDOW: usize = 64;
+
+const RESTORED_CAP_MAX: usize = 32;
 
 fn window_ttl() -> Duration {
     Duration::from_secs(VERIFICATION_WINDOW_BLOCKS * BLOCK_TIME_SECS)
@@ -93,6 +110,40 @@ fn evict_expired(window: &mut VecDeque<WindowEntry>) {
             break;
         }
     }
+    while window.len() > PERFORMANCE_WINDOW_SIZE {
+        window.pop_front();
+    }
+}
+
+fn push_bucketed(buckets: &mut VecDeque<(Instant, f64)>, now: Instant, amount: f64) {
+    match buckets.back_mut() {
+        Some((start, sum)) if now.duration_since(*start).as_secs() < DELIVERED_WORK_BUCKET_SECS => {
+            *sum += amount;
+        }
+        _ => buckets.push_back((now, amount)),
+    }
+    let ttl = window_ttl() + Duration::from_secs(DELIVERED_WORK_BUCKET_SECS);
+    while let Some((start, _)) = buckets.front() {
+        if now.duration_since(*start) > ttl {
+            buckets.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+fn evict_timed(samples: &mut VecDeque<(Instant, f64)>, cap: usize) {
+    let ttl = window_ttl();
+    while let Some((ts, _)) = samples.front() {
+        if ts.elapsed() > ttl {
+            samples.pop_front();
+        } else {
+            break;
+        }
+    }
+    while samples.len() > cap {
+        samples.pop_front();
+    }
 }
 
 impl PerformanceTracker {
@@ -104,12 +155,20 @@ impl PerformanceTracker {
             cap_events: Vec::new(),
             pending_evictions: Vec::new(),
             at_cap_last_touched: HashMap::new(),
+            unit_times: HashMap::new(),
+            unit_reference_cache: HashMap::new(),
+            rel_speed: HashMap::new(),
+            unit_own_best: HashMap::new(),
+            miner_slowdown: HashMap::new(),
+            delivered_work: HashMap::new(),
+            total_records: 0,
             persistence_path: Some(path),
         };
         tracker.load();
         tracker
     }
 
+    #[cfg(test)]
     pub fn record(
         &mut self,
         uid: u16,
@@ -118,12 +177,25 @@ impl PerformanceTracker {
         response_time: f64,
         was_at_capacity: bool,
     ) {
+        self.record_keyed(uid, hotkey, success, response_time, was_at_capacity, "");
+    }
+
+    pub fn record_keyed(
+        &mut self,
+        uid: u16,
+        hotkey: &str,
+        success: bool,
+        response_time: f64,
+        was_at_capacity: bool,
+        work_key: &str,
+    ) {
         self.record_with_time(
             uid,
             hotkey,
             success,
             response_time,
             was_at_capacity,
+            work_key,
             Instant::now(),
         );
     }
@@ -135,11 +207,56 @@ impl PerformanceTracker {
         success: bool,
         response_time: f64,
         was_at_capacity: bool,
+        work_key: &str,
         now: Instant,
     ) {
+        self.total_records = self.total_records.wrapping_add(1);
         let window = self.windows.entry(uid).or_default();
         window.push_back((now, success, response_time));
         evict_expired(window);
+
+        if success && response_time > 0.0 {
+            let unit = self.unit_times.entry(work_key.to_string()).or_default();
+            unit.push_back((now, response_time));
+            evict_timed(unit, UNIT_TIMES_CAP);
+
+            // The miner's own best latency on this unit, held for a full window
+            // so sustained load can't drag the baseline up with it. It only
+            // resets upward when no faster sample has been seen for the whole
+            // TTL (a genuine, lasting slowdown), not when we are congesting it.
+            let best_entry = self
+                .unit_own_best
+                .entry(uid)
+                .or_default()
+                .entry(work_key.to_string())
+                .or_insert((now, response_time));
+            if response_time <= best_entry.1 || now.duration_since(best_entry.0) > window_ttl() {
+                *best_entry = (now, response_time);
+            }
+            let own_best = best_entry.1;
+
+            if own_best > 0.0 {
+                // Saturation: how far this miner's current latency has drifted
+                // above its own best. Drives the cap, self-referential.
+                let slowdown = (response_time / own_best).max(1.0);
+                let trend = self.miner_slowdown.entry(uid).or_default();
+                trend.push_back((now, slowdown));
+                evict_timed(trend, SLOWDOWN_WINDOW);
+
+                // Weight rate: the circuit's fast end (load-independent) over
+                // this miner's own best. Both ends ignore queue latency, so the
+                // ratio reflects intrinsic speed and cannot be inflated by load.
+                let reference = self.cached_unit_reference(work_key);
+                if reference > 0.0 {
+                    let rel = reference / own_best;
+                    let samples = self.rel_speed.entry(uid).or_default();
+                    samples.push_back((now, rel));
+                    evict_timed(samples, REL_SPEED_WINDOW);
+
+                    push_bucketed(self.delivered_work.entry(uid).or_default(), now, reference);
+                }
+            }
+        }
 
         if was_at_capacity {
             let results = self.at_cap_results.entry(uid).or_default();
@@ -152,10 +269,27 @@ impl PerformanceTracker {
         }
     }
 
+    #[cfg(test)]
     pub fn record_reschedule(&mut self, uid: u16) {
+        self.record_reschedule_keyed(uid, "");
+    }
+
+    pub fn record_reschedule_keyed(&mut self, uid: u16, work_key: &str) {
+        let now = Instant::now();
         let window = self.windows.entry(uid).or_default();
-        window.push_back((Instant::now(), false, PERFORMANCE_RESCHEDULE_PENALTY));
+        window.push_back((now, false, PERFORMANCE_RESCHEDULE_PENALTY));
         evict_expired(window);
+
+        if !work_key.is_empty() {
+            let reference = self.cached_unit_reference(work_key);
+            if reference > 0.0 {
+                push_bucketed(
+                    self.delivered_work.entry(uid).or_default(),
+                    now,
+                    -(reference * FAILURE_DEBIT_MULTIPLIER),
+                );
+            }
+        }
     }
 
     pub fn adaptive_timeout(&self) -> f64 {
@@ -378,7 +512,7 @@ impl PerformanceTracker {
                     _ => continue,
                 };
                 let cap = match arr[0].as_u64() {
-                    Some(c) => c as usize,
+                    Some(c) => (c as usize).min(RESTORED_CAP_MAX),
                     None => continue,
                 };
                 let results: VecDeque<bool> = arr[1]
@@ -395,62 +529,44 @@ impl PerformanceTracker {
     }
 
     pub fn snapshot(&self) -> HashMap<u16, (f64, usize)> {
-        let reference = self.scoring_reference_time();
         self.windows
             .iter()
-            .map(|(&uid, w)| (uid, (Self::uid_rate(w, reference), w.len())))
+            .map(|(&uid, w)| (uid, (self.miner_rel_speed(uid).unwrap_or(0.0), w.len())))
             .collect()
     }
 
     pub fn throughput_snapshot(&self) -> HashMap<u16, (f64, usize, usize)> {
-        let reference = self.scoring_reference_time();
         self.windows
             .iter()
             .map(|(&uid, w)| {
-                let rate = Self::uid_rate(w, reference);
-                let cap = if w.len() < PERFORMANCE_MIN_SAMPLES {
-                    1
-                } else {
-                    self.adaptive_caps.get(&uid).copied().unwrap_or(1)
-                };
-                (uid, (rate, cap, w.len()))
+                let work = self.miner_delivered_work(uid);
+                let cap = self.adaptive_caps.get(&uid).copied().unwrap_or(1);
+                (uid, (work, cap, w.len()))
             })
             .collect()
     }
 
-    fn scoring_reference_time(&self) -> f64 {
-        let mut times: Vec<f64> = self
-            .windows
-            .values()
-            .flat_map(|w| w.iter().filter(|(_, s, _)| *s).map(|(_, _, t)| *t))
-            .collect();
-
-        if times.len() < PERFORMANCE_MIN_SAMPLES {
-            return CIRCUIT_TIMEOUT_SECONDS as f64;
-        }
-
-        times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let idx = ((times.len() as f64 * PERFORMANCE_SCORING_PERCENTILE) as usize)
-            .min(times.len().saturating_sub(1));
-        times[idx].max(1.0)
+    pub fn sample_counts(&self) -> HashMap<u16, usize> {
+        self.windows
+            .iter()
+            .map(|(&uid, w)| (uid, w.len()))
+            .collect()
     }
 
-    fn uid_rate(w: &VecDeque<WindowEntry>, reference: f64) -> f64 {
-        if w.is_empty() {
-            return 0.0;
-        }
-        let mut total = 0.0;
-        for &(_, success, rt) in w {
-            if rt == PERFORMANCE_RESCHEDULE_PENALTY {
-                total += PERFORMANCE_RESCHEDULE_PENALTY;
-            } else if !success {
-            } else if rt <= 0.0 {
-                total += 2.0;
-            } else {
-                total += (reference / rt).min(2.0);
-            }
-        }
-        (total / w.len() as f64).max(0.0)
+    fn miner_delivered_work(&self, uid: u16) -> f64 {
+        let buckets = match self.delivered_work.get(&uid) {
+            Some(b) => b,
+            None => return 0.0,
+        };
+        let ttl = window_ttl();
+        buckets
+            .iter()
+            .filter(|(start, _)| {
+                start.elapsed() <= ttl + Duration::from_secs(DELIVERED_WORK_BUCKET_SECS)
+            })
+            .map(|(_, sum)| *sum)
+            .sum::<f64>()
+            .max(0.0)
     }
 
     pub fn reset_uid(&mut self, uid: u16, hotkey: &str) {
@@ -458,8 +574,82 @@ impl PerformanceTracker {
         self.adaptive_caps.remove(&uid);
         self.at_cap_results.remove(&uid);
         self.at_cap_last_touched.remove(&uid);
+        self.rel_speed.remove(&uid);
+        self.unit_own_best.remove(&uid);
+        self.miner_slowdown.remove(&uid);
+        self.delivered_work.remove(&uid);
         self.pending_evictions.retain(|(u, _)| *u != uid);
         self.cap_events.retain(|e| e.hotkey != hotkey);
+    }
+
+    fn unit_reference(&self, work_key: &str) -> f64 {
+        let samples = match self.unit_times.get(work_key) {
+            Some(s) if s.len() >= UNIT_REFERENCE_MIN_SAMPLES => s,
+            _ => return 0.0,
+        };
+        let mut times: Vec<f64> = samples.iter().map(|(_, t)| *t).collect();
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let idx = ((times.len() as f64 * CAPACITY_UNIT_REFERENCE_PERCENTILE) as usize)
+            .min(times.len().saturating_sub(1));
+        times[idx]
+    }
+
+    fn cached_unit_reference(&mut self, work_key: &str) -> f64 {
+        if let Some((at, reference)) = self.unit_reference_cache.get(work_key) {
+            if self.total_records.saturating_sub(*at) < UNIT_REFERENCE_REFRESH_RECORDS {
+                return *reference;
+            }
+        }
+        let reference = self.unit_reference(work_key);
+        if reference > 0.0 {
+            self.unit_reference_cache
+                .insert(work_key.to_string(), (self.total_records, reference));
+        }
+        reference
+    }
+
+    fn miner_rel_speed(&self, uid: u16) -> Option<f64> {
+        let samples = self.rel_speed.get(&uid)?;
+        let ttl = window_ttl();
+        let mut count = 0usize;
+        let sum: f64 = samples
+            .iter()
+            .filter(|(ts, _)| ts.elapsed() <= ttl)
+            .map(|(_, r)| {
+                count += 1;
+                *r
+            })
+            .sum();
+        if count == 0 {
+            return None;
+        }
+        Some(sum / count as f64)
+    }
+
+    /// How much a miner's recent latency has degraded relative to its own
+    /// best on the same work units. 1.0 means it is serving at its unloaded
+    /// speed (spare capacity); a higher value means the load we are giving it
+    /// is congesting it. This is purely self-referential, so it cannot couple
+    /// one miner's capacity to another's and cannot drive a feedback spiral.
+    fn miner_saturation(&self, uid: u16) -> f64 {
+        let samples = match self.miner_slowdown.get(&uid) {
+            Some(s) => s,
+            None => return 1.0,
+        };
+        let ttl = window_ttl();
+        let mut count = 0usize;
+        let sum: f64 = samples
+            .iter()
+            .filter(|(ts, _)| ts.elapsed() <= ttl)
+            .map(|(_, s)| {
+                count += 1;
+                *s
+            })
+            .sum();
+        if count == 0 {
+            return 1.0;
+        }
+        sum / count as f64
     }
 
     fn update_adaptive_cap(&mut self, uid: u16, hotkey: &str) {
@@ -469,6 +659,8 @@ impl PerformanceTracker {
             }
             _ => return,
         };
+
+        let saturation = self.miner_saturation(uid);
 
         let current = self.adaptive_caps.entry(uid).or_insert(1);
         let cap_from = *current;
@@ -487,8 +679,13 @@ impl PerformanceTracker {
                 }
                 return;
             }
-            *current += 1;
-            direction = Some(CapDirection::Ramp);
+            if saturation <= CAPACITY_SATURATION_TOLERANCE {
+                *current += 1;
+                direction = Some(CapDirection::Ramp);
+            } else if *current > 1 {
+                *current -= 1;
+                direction = Some(CapDirection::Backoff);
+            }
             if let Some(r) = self.at_cap_results.get_mut(&uid) {
                 r.clear();
             }
@@ -627,6 +824,13 @@ mod tests {
             cap_events: Vec::new(),
             pending_evictions: Vec::new(),
             at_cap_last_touched: HashMap::new(),
+            unit_times: HashMap::new(),
+            unit_reference_cache: HashMap::new(),
+            rel_speed: HashMap::new(),
+            unit_own_best: HashMap::new(),
+            miner_slowdown: HashMap::new(),
+            delivered_work: HashMap::new(),
+            total_records: 0,
             persistence_path: None,
         }
     }
@@ -733,8 +937,8 @@ mod tests {
         let stale = now
             .checked_sub(window_ttl() + Duration::from_secs(60))
             .expect("Instant arithmetic");
-        tracker.record_with_time(1, "hk", true, 5.0, false, stale);
-        tracker.record_with_time(1, "hk", true, 6.0, false, now);
+        tracker.record_with_time(1, "hk", true, 5.0, false, "", stale);
+        tracker.record_with_time(1, "hk", true, 6.0, false, "", now);
         let window = tracker.windows.get(&1).unwrap();
         assert_eq!(window.len(), 1);
         assert_eq!(window[0].2, 6.0);
@@ -769,6 +973,161 @@ mod tests {
         assert_eq!(events[0].direction, CapDirection::Backoff);
         assert_eq!(events[0].cap_from, 2);
         assert_eq!(events[0].cap_to, 1);
+    }
+
+    #[test]
+    fn cap_reflects_sustainable_concurrency_not_absolute_speed() {
+        // Two miners, one 25x slower per proof, both with perfectly stable
+        // latency. Capacity tracks each miner's own saturation, not its speed,
+        // so a slow-but-stable miner is utilized just as fully as a fast one.
+        let mut tracker = test_tracker();
+        for _ in 0..400 {
+            tracker.record(1, "fast", true, 2.0, true);
+            tracker.record(2, "slow", true, 50.0, true);
+        }
+        let caps = tracker.cap_snapshot();
+        let fast = caps.get(&1).copied().unwrap_or(0);
+        let slow = caps.get(&2).copied().unwrap_or(0);
+        assert!(
+            fast > 4 && slow > 4,
+            "both should ramp: fast={fast}, slow={slow}"
+        );
+        assert_eq!(
+            fast, slow,
+            "absolute speed must not affect capacity: fast={fast}, slow={slow}"
+        );
+    }
+
+    #[test]
+    fn cap_backs_off_when_own_latency_degrades() {
+        // Ramp on stable latency, then degrade it relative to the miner's own
+        // best. The self-referential saturation signal must trim the cap.
+        let mut tracker = test_tracker();
+        for _ in 0..300 {
+            tracker.record(1, "hk", true, 2.0, true);
+        }
+        let high = tracker.cap_snapshot().get(&1).copied().unwrap_or(0);
+        assert!(high >= 4, "expected ramp-up before degradation, got {high}");
+        tracker.cap_events.clear();
+        for _ in 0..CAPACITY_MIN_AT_CAP {
+            tracker.record(1, "hk", true, 100.0, true);
+        }
+        let events = tracker.drain_cap_events();
+        assert!(
+            events.iter().any(|e| e.direction == CapDirection::Backoff),
+            "degrading own latency should trigger a backoff, got {events:?}"
+        );
+    }
+
+    #[test]
+    fn unit_reference_prices_delivered_work() {
+        let mut tracker = test_tracker();
+        for _ in 0..400 {
+            tracker.record_keyed(0, "a", true, 100.0, false, "A");
+            tracker.record_keyed(0, "a", true, 100.0, false, "A");
+            tracker.record_keyed(3, "b", true, 1.0, false, "B");
+            tracker.record_keyed(3, "b", true, 1.0, false, "B");
+            tracker.record_keyed(1, "x", true, 50.0, true, "A");
+            tracker.record_keyed(2, "y", true, 2.0, true, "B");
+        }
+        let snap = tracker.throughput_snapshot();
+        let x = snap.get(&1).map(|&(w, _, _)| w).unwrap_or(0.0);
+        let y = snap.get(&2).map(|&(w, _, _)| w).unwrap_or(0.0);
+        assert!(
+            x > y,
+            "equal volume on a heavier unit must earn more: x={x}, y={y}"
+        );
+    }
+
+    #[test]
+    fn delivered_work_accrues_only_on_verified_success() {
+        let mut tracker = test_tracker();
+        for _ in 0..200 {
+            tracker.record_keyed(1, "a", true, 2.0, false, "A");
+            tracker.record_keyed(2, "b", true, 2.0, false, "A");
+            tracker.record_keyed(2, "b", false, 2.0, false, "A");
+        }
+        for _ in 0..200 {
+            tracker.record_keyed(1, "a", true, 2.0, false, "A");
+        }
+        let snap = tracker.throughput_snapshot();
+        let w1 = snap.get(&1).map(|&(w, _, _)| w).unwrap_or(0.0);
+        let w2 = snap.get(&2).map(|&(w, _, _)| w).unwrap_or(0.0);
+        assert!(w1 > 0.0 && w2 > 0.0);
+        assert!(
+            w1 > w2 * 1.5,
+            "failures must not earn work credit: w1={w1}, w2={w2}"
+        );
+    }
+
+    #[test]
+    fn failures_debit_referenced_work_only() {
+        let mut tracker = test_tracker();
+        for _ in 0..100 {
+            tracker.record_keyed(1, "a", true, 2.0, false, "A");
+            tracker.record_keyed(2, "b", true, 2.0, false, "A");
+        }
+        let before = tracker
+            .throughput_snapshot()
+            .get(&2)
+            .map(|&(w, _, _)| w)
+            .unwrap_or(0.0);
+        assert!(before > 0.0);
+
+        for _ in 0..10 {
+            tracker.record_reschedule_keyed(2, "B");
+        }
+        let after_unreferenced = tracker
+            .throughput_snapshot()
+            .get(&2)
+            .map(|&(w, _, _)| w)
+            .unwrap_or(0.0);
+        assert_eq!(before, after_unreferenced);
+
+        for _ in 0..10 {
+            tracker.record_reschedule_keyed(2, "A");
+        }
+        let after_referenced = tracker
+            .throughput_snapshot()
+            .get(&2)
+            .map(|&(w, _, _)| w)
+            .unwrap_or(0.0);
+        assert!(
+            after_referenced < after_unreferenced,
+            "referenced failures must debit: before={after_unreferenced}, after={after_referenced}"
+        );
+
+        for _ in 0..200 {
+            tracker.record_reschedule_keyed(2, "A");
+        }
+        let floored = tracker
+            .throughput_snapshot()
+            .get(&2)
+            .map(|&(w, _, _)| w)
+            .unwrap_or(f64::MIN);
+        assert_eq!(floored, 0.0);
+    }
+
+    #[test]
+    fn unmeasured_miner_ranks_zero_not_neutral() {
+        let mut tracker = test_tracker();
+        for _ in 0..(PERFORMANCE_MIN_SAMPLES + 10) {
+            tracker.record_reschedule(3);
+            tracker.record_keyed(4, "hk", true, 2.0, false, "A");
+        }
+        let rate = tracker
+            .snapshot()
+            .get(&3)
+            .map(|&(r, _)| r)
+            .expect("uid 3 tracked");
+        assert_eq!(rate, 0.0);
+        let (work, _, count) = tracker
+            .throughput_snapshot()
+            .get(&3)
+            .copied()
+            .expect("uid 3 tracked");
+        assert_eq!(work, 0.0);
+        assert!(count >= PERFORMANCE_MIN_SAMPLES);
     }
 
     #[test]
