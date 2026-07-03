@@ -40,6 +40,11 @@ impl ValidatorLoop {
                 self.timings.metagraph_sync = now;
             }
 
+            if now.duration_since(self.timings.miner_registry_refresh) > Duration::from_secs(60) {
+                self.refresh_miner_connections().await;
+                self.timings.miner_registry_refresh = now;
+            }
+
             if now.duration_since(self.timings.cooldown_prune) > Duration::from_secs(60) {
                 self.prune_expired_cooldowns();
                 self.timings.cooldown_prune = now;
@@ -381,6 +386,12 @@ impl ValidatorLoop {
             "metagraph synced"
         );
 
+        self.refresh_miner_connections().await;
+
+        Ok(())
+    }
+
+    pub(super) async fn refresh_miner_connections(&mut self) {
         let quic_miners: Vec<QuicAxonInfo> = self
             .config
             .metagraph
@@ -399,14 +410,12 @@ impl ValidatorLoop {
             let mut client = self.miner_client.write().await;
             if let Err(e) = client
                 .lightning_mut()
-                .update_miner_registry(quic_miners.clone())
+                .update_miner_registry(quic_miners)
                 .await
             {
                 warn!(error = %e, "updating QUIC miner connections");
             }
         }
-
-        Ok(())
     }
 
     async fn update_weights(&mut self) -> Result<()> {
@@ -458,7 +467,10 @@ impl ValidatorLoop {
             info!(
                 tracked = tracked.len(),
                 adaptive_timeout = format!("{adaptive_to:.1}s"),
-                top5 = ?top.iter().map(|(uid, w, c)| format!("uid={uid} work={w:.1} cap={c}")).collect::<Vec<_>>(),
+                top5 = ?top.iter().map(|(uid, w, c)| {
+                    let (credit, debit, uncredited) = self.performance_tracker.delivered_breakdown(*uid);
+                    format!("uid={uid} work={w:.1} credit={credit:.1} debit={debit:.1} uncredited_fails={uncredited} cap={c}")
+                }).collect::<Vec<_>>(),
                 "throughput scoring"
             );
         }
