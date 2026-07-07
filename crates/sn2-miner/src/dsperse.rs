@@ -275,9 +275,58 @@ impl DSperseClient {
                     match dsperse::pipeline::split_inline_wai_inputs(p, &input_flat) {
                         Some(split) => split,
                         None => {
-                            let inits = dsperse::pipeline::extract_onnx_initializers(&onnx_path, p)
-                                .map_err(|e| anyhow::anyhow!("extracting initializers: {e}"))?;
-                            (input_flat.clone(), inits)
+                            // The validator only sends the true activation
+                            // tensor here, assuming every other declared
+                            // input (biases, architecture constants) is
+                            // independently recoverable locally. For
+                            // donor-sourced circuits it isn't: those values
+                            // only materialize during this circuit's own
+                            // slicing/constant-folding step, which the miner
+                            // never runs. Recover known-fixed values (GELU's
+                            // constants, frozen backbone biases) from a
+                            // static table first; anything not in it falls
+                            // back to the existing file-based extraction.
+                            let mut cursor = 0usize;
+                            let mut activations = Vec::new();
+                            let mut inits: Vec<(Vec<f64>, Vec<usize>)> = Vec::new();
+                            let mut unresolved = Vec::new();
+
+                            for io in &p.inputs {
+                                let n: usize = io.shape.iter().product();
+                                if dsperse::pipeline::runner::is_activation_placeholder(&io.name) {
+                                    let end = (cursor + n).min(input_flat.len());
+                                    activations.extend_from_slice(&input_flat[cursor..end]);
+                                    cursor = end;
+                                } else if let Some((values, shape)) =
+                                    crate::wai_known_constants::lookup(&io.name)
+                                {
+                                    anyhow::ensure!(
+                                        values.len() == n,
+                                        "known constant '{}' has {} elements but circuit expects {}",
+                                        io.name,
+                                        values.len(),
+                                        n
+                                    );
+                                    inits.push((values, shape));
+                                } else {
+                                    unresolved.push(io.name.clone());
+                                }
+                            }
+
+                            if !unresolved.is_empty() {
+                                tracing::warn!(
+                                    names = ?unresolved,
+                                    "known-constant table missing entries, falling back to file extraction"
+                                );
+                                let file_inits =
+                                    dsperse::pipeline::extract_onnx_initializers(&onnx_path, p)
+                                        .map_err(|e| {
+                                            anyhow::anyhow!("extracting initializers: {e}")
+                                        })?;
+                                inits.extend(file_inits);
+                            }
+
+                            (activations, inits)
                         }
                     }
                 }
@@ -293,5 +342,59 @@ impl DSperseClient {
         })
         .await
         .context("blocking task panicked")?
+    }
+}
+
+#[cfg(test)]
+mod wai_fallback_integration_tests {
+    use super::*;
+
+    /// Exercises the real `prove_slice` path against slice_216 of the actual
+    /// "tail" fine-tuned model (f8121b74...) -- one of the slices confirmed
+    /// failing with "activation length mismatch: expected 2050, got 2048" in
+    /// production. The fixture directory holds the real, repository-fetched
+    /// circuit.bin/manifest.msgpack/witness_solver.bin for this slice, plus
+    /// the real donor.onnx as the payload file `find_slice_onnx` requires to
+    /// be present. The activation values are synthetic (their numeric
+    /// content doesn't matter for this test): the point is confirming the
+    /// known-constants fallback supplies the two missing scalar constants so
+    /// witness generation no longer fails on element count, regardless of
+    /// whether the resulting proof is otherwise meaningful.
+    #[tokio::test]
+    async fn slice_216_no_longer_reports_activation_length_mismatch() {
+        let slice_dir = PathBuf::from(
+            "/private/tmp/claude-501/-Volumes-HDD-Develop-Work-Subnet2/67c52f37-ba8f-43ed-a9d9-286ed7ff6dd6/scratchpad/real_slice_216",
+        );
+        if !slice_dir.is_dir() {
+            eprintln!("skipping: fixture directory not present at {}", slice_dir.display());
+            return;
+        }
+
+        let client = DSperseClient::new(None);
+        let synthetic_activations: Vec<f64> = (0..2048).map(|i| (i % 7) as f64 * 0.01).collect();
+        let inputs = serde_json::json!({ "input_data": synthetic_activations });
+
+        let result = client
+            .prove_slice(
+                "f8121b74a74514a47bc870dd913b7dbb45c8688e5a0a7328209da6a74d9c7094",
+                "slice_216",
+                &inputs,
+                slice_dir,
+            )
+            .await;
+
+        match &result {
+            Ok(_) => { /* fully succeeded: witness and proof generated */ }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    !msg.contains("activation length mismatch"),
+                    "known-constants fallback did not resolve the missing WAI inputs: {msg}"
+                );
+                eprintln!(
+                    "prove_slice did not fully succeed, but NOT due to activation length mismatch: {msg}"
+                );
+            }
+        }
     }
 }

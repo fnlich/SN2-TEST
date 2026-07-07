@@ -6,6 +6,7 @@ mod handlers;
 mod lightning_server;
 mod nftables;
 mod roster;
+mod wai_known_constants;
 
 use std::net::IpAddr;
 use std::sync::Arc;
