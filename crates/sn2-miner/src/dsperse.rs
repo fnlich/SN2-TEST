@@ -1,4 +1,7 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use sn2_types::json_tensor::flatten_json_to_f64;
@@ -6,6 +9,21 @@ use tracing::info;
 
 pub struct DSperseClient {
     cache_dir: PathBuf,
+    /// Shared across every request so its internal bundle cache
+    /// (`load_bundle_cached`) actually gets reused instead of being
+    /// discarded and rebuilt on every single call. A circuit bundle is
+    /// tens of megabytes read and parsed from disk; a fresh backend per
+    /// request means a fresh cache-miss every time, even for a circuit
+    /// that was just proved a moment ago. Mirrors the pattern already
+    /// used by `sn2-verify`'s validator-side `BACKEND` static.
+    backend: Arc<dsperse::backend::jstprove::JstproveBackend>,
+    /// Caches `resolve_component`'s (component_sha, slice_id) -> slice_dir
+    /// lookups, avoiding a full scan of every locally cached model
+    /// directory on repeat DSlice requests for the same component.
+    component_cache: RwLock<HashMap<(String, String), PathBuf>>,
+    /// Caches `find_slice_onnx`'s slice_dir -> onnx_path resolution,
+    /// avoiding a directory listing on every repeat prove_slice call.
+    onnx_cache: RwLock<HashMap<PathBuf, PathBuf>>,
 }
 
 fn validate_circuit_id(id: &str) -> Result<()> {
@@ -118,7 +136,51 @@ impl DSperseClient {
                 .to_string(),
         );
         info!(cache_dir = %cache_dir.display(), "initialized DSperseClient");
-        Self { cache_dir }
+
+        let backend = Arc::new(dsperse::backend::jstprove::JstproveBackend::new());
+        {
+            let backend = Arc::clone(&backend);
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(Duration::from_secs(sn2_types::BUNDLE_CACHE_IDLE_TTL_SECS));
+                loop {
+                    interval.tick().await;
+                    let evicted = backend.evict_idle(Duration::from_secs(
+                        sn2_types::BUNDLE_CACHE_IDLE_TTL_SECS,
+                    ));
+                    if evicted > 0 {
+                        info!(evicted, "evicted idle compiled circuit bundles");
+                    }
+                }
+            });
+        }
+
+        Self {
+            cache_dir,
+            backend,
+            component_cache: RwLock::new(HashMap::new()),
+            onnx_cache: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn resolve_slice_onnx(&self, slice_dir: &Path) -> Result<PathBuf> {
+        if let Some(cached) = self
+            .onnx_cache
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(slice_dir)
+            .cloned()
+        {
+            if cached.exists() {
+                return Ok(cached);
+            }
+        }
+        let resolved = find_slice_onnx(slice_dir)?;
+        self.onnx_cache
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(slice_dir.to_path_buf(), resolved.clone());
+        Ok(resolved)
     }
 
     pub fn cache_dir(&self) -> &Path {
@@ -130,10 +192,30 @@ impl DSperseClient {
         component_sha: &str,
         slice_id: &str,
     ) -> Result<Option<PathBuf>> {
+        let cache_key = (component_sha.to_string(), slice_id.to_string());
+
+        if let Some(cached) = self
+            .component_cache
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&cache_key)
+            .cloned()
+        {
+            if cached.join("jstprove").join("circuit.bundle").is_dir() {
+                return Ok(Some(cached));
+            }
+            // Stale (e.g. evicted from disk since caching) -- drop it and
+            // fall through to a full re-resolution below.
+            self.component_cache
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&cache_key);
+        }
+
         let cache_dir = self.cache_dir.clone();
-        let component_sha = component_sha.to_string();
-        let slice_id = slice_id.to_string();
-        tokio::task::spawn_blocking(move || -> Result<Option<PathBuf>> {
+        let scan_component_sha = component_sha.to_string();
+        let scan_slice_id = slice_id.to_string();
+        let resolved: Option<PathBuf> = tokio::task::spawn_blocking(move || -> Result<Option<PathBuf>> {
             let entries = match std::fs::read_dir(&cache_dir) {
                 Ok(e) => e,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -153,11 +235,11 @@ impl DSperseClient {
                 let stamp_path = entry
                     .path()
                     .join("slices")
-                    .join(&slice_id)
+                    .join(&scan_slice_id)
                     .join("component.sha");
                 if let Ok(stamp) = std::fs::read_to_string(&stamp_path) {
-                    if stamp.trim() == component_sha {
-                        let slice_dir = entry.path().join("slices").join(&slice_id);
+                    if stamp.trim() == scan_component_sha {
+                        let slice_dir = entry.path().join("slices").join(&scan_slice_id);
                         if !slice_dir.join("jstprove").join("circuit.bundle").is_dir() {
                             continue;
                         }
@@ -171,7 +253,16 @@ impl DSperseClient {
             Ok(None)
         })
         .await
-        .context("component resolution task panicked")?
+        .context("component resolution task panicked")??;
+
+        if let Some(ref slice_dir) = resolved {
+            self.component_cache
+                .write()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(cache_key, slice_dir.clone());
+        }
+
+        Ok(resolved)
     }
 
     pub async fn prove(
@@ -196,10 +287,10 @@ impl DSperseClient {
         );
 
         let inputs_clone = inputs.clone();
+        let backend = Arc::clone(&self.backend);
 
         tokio::task::spawn_blocking(move || -> Result<ProveArtifacts> {
             let inputs_bytes = rmp_serde::to_vec_named(&inputs_clone)?;
-            let backend = dsperse::backend::jstprove::JstproveBackend::new();
 
             let params = backend
                 .load_params(&circuit_path)
@@ -237,7 +328,7 @@ impl DSperseClient {
         );
 
         let circuit_path = slice_dir.join("jstprove").join("circuit.bundle");
-        let onnx_path = find_slice_onnx(&slice_dir)?;
+        let onnx_path = self.resolve_slice_onnx(&slice_dir)?;
 
         anyhow::ensure!(
             circuit_path.is_dir(),
@@ -258,6 +349,7 @@ impl DSperseClient {
         );
 
         let input_data = extract_input_json(inputs).clone();
+        let backend = Arc::clone(&self.backend);
 
         tokio::task::spawn_blocking(move || -> Result<ProveArtifacts> {
             let input_flat = flatten_json_to_f64(&input_data);
@@ -266,7 +358,6 @@ impl DSperseClient {
                 "invalid input tensor: flattened input is empty"
             );
 
-            let backend = dsperse::backend::jstprove::JstproveBackend::new();
             let params = backend
                 .load_params(&circuit_path)
                 .map_err(|e| anyhow::anyhow!("loading circuit params: {e}"))?;
