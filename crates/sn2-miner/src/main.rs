@@ -1,3 +1,29 @@
+#[cfg(target_os = "linux")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+// Mimalloc reads option env vars on first option access (lazy). The default
+// `purge_delay` of ~1s churns the page tables under our proving workload's
+// allocation frequency (witness/proof buffers allocated and freed across
+// many concurrent blocking threads), the same single-thread allocator
+// bottleneck the validator observed on its dispatch workload (38k
+// mmap/munmap syscalls per 3s on mainnet before this fix). Setting the env
+// var from a constructor that runs before main() (and crucially before the
+// tokio runtime build) captures the desired cadence before any sustained
+// allocation. Operators can still override by setting the env var
+// explicitly in their process environment.
+#[cfg(target_os = "linux")]
+#[ctor::ctor]
+fn configure_mimalloc_purge_delay() {
+    // SAFETY: ctor runs single-threaded before main; no other thread can
+    // race on environment state at this point.
+    unsafe {
+        if std::env::var_os("MIMALLOC_PURGE_DELAY").is_none() {
+            std::env::set_var("MIMALLOC_PURGE_DELAY", "60000");
+        }
+    }
+}
+
 mod allowlist;
 mod cli;
 mod dsperse;

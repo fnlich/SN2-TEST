@@ -24,6 +24,14 @@ pub struct DSperseClient {
     /// Caches `find_slice_onnx`'s slice_dir -> onnx_path resolution,
     /// avoiding a directory listing on every repeat prove_slice call.
     onnx_cache: RwLock<HashMap<PathBuf, PathBuf>>,
+    /// Caches the fallback whole-file ONNX initializer extraction
+    /// (`extract_onnx_initializers`), keyed by onnx_path. Only hit when
+    /// the known-constants table is missing an entry, but when it is,
+    /// the result is fully deterministic for a given circuit -- re-reading
+    /// and re-parsing the same donor ONNX file on every repeat request
+    /// for that slice is pure waste. `Arc`-wrapped since it's read and
+    /// populated from inside `spawn_blocking`, not just `&self` methods.
+    onnx_initializers_cache: Arc<RwLock<HashMap<PathBuf, Vec<(Vec<f64>, Vec<usize>)>>>>,
 }
 
 fn validate_circuit_id(id: &str) -> Result<()> {
@@ -160,6 +168,7 @@ impl DSperseClient {
             backend,
             component_cache: RwLock::new(HashMap::new()),
             onnx_cache: RwLock::new(HashMap::new()),
+            onnx_initializers_cache: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -350,6 +359,7 @@ impl DSperseClient {
 
         let input_data = extract_input_json(inputs).clone();
         let backend = Arc::clone(&self.backend);
+        let onnx_initializers_cache = Arc::clone(&self.onnx_initializers_cache);
 
         tokio::task::spawn_blocking(move || -> Result<ProveArtifacts> {
             let input_flat = flatten_json_to_f64(&input_data);
@@ -409,11 +419,27 @@ impl DSperseClient {
                                     names = ?unresolved,
                                     "known-constant table missing entries, falling back to file extraction"
                                 );
-                                let file_inits =
-                                    dsperse::pipeline::extract_onnx_initializers(&onnx_path, p)
+                                let cached_file_inits = onnx_initializers_cache
+                                    .read()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .get(&onnx_path)
+                                    .cloned();
+                                let file_inits = match cached_file_inits {
+                                    Some(cached) => cached,
+                                    None => {
+                                        let extracted = dsperse::pipeline::extract_onnx_initializers(
+                                            &onnx_path, p,
+                                        )
                                         .map_err(|e| {
                                             anyhow::anyhow!("extracting initializers: {e}")
                                         })?;
+                                        onnx_initializers_cache
+                                            .write()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .insert(onnx_path.clone(), extracted.clone());
+                                        extracted
+                                    }
+                                };
                                 inits.extend(file_inits);
                             }
 
