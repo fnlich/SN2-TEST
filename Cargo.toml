@@ -1,3 +1,19 @@
+[profile.release]
+# Default release profile leaves real performance on the table for
+# CPU-bound cryptographic code (FFT, field arithmetic, polynomial
+# commitments in the proving path): fat LTO enables cross-crate inlining
+# and dead-code elimination that split codegen units block, and a single
+# codegen unit lets the optimizer see the whole crate at once instead of
+# 16 independently-optimized chunks. Costs meaningfully longer release
+# builds; worth it for a binary built once and run for a long time.
+# Deliberately NOT setting panic = "abort": sn2-miner relies on
+# spawn_blocking panics being caught as JoinErrors and turned into clean
+# per-request error responses (see dsperse.rs's "blocking task panicked"
+# context) rather than taking down the whole process -- abort would
+# silently defeat that isolation.
+lto = "fat"
+codegen-units = 1
+
 [workspace]
 members = [
     "crates/sn2-types",

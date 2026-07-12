@@ -1,0 +1,11 @@
+# Safe only because this workspace is built directly on its production
+# deployment hosts (confirmed: R8a instances, 5th-gen AMD EPYC "Turin").
+# target-cpu=native lets the compiler use every instruction set extension
+# the build machine actually supports (AVX-512, BMI2, etc.) instead of a
+# generic x86-64 baseline -- real speedup potential for the FFT/field-
+# arithmetic-heavy proving path. If you ever build on a different machine
+# than you deploy to (CI, a dev laptop, a different instance generation),
+# REMOVE this or the resulting binary can crash with an illegal
+# instruction on the mismatched deploy target.
+[build]
+rustflags = ["-C", "target-cpu=native"]
