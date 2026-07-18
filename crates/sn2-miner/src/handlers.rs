@@ -97,7 +97,27 @@ impl MinerHandlers {
         let resolved_dir = match component_sha {
             Some(sha) => {
                 let slice_id = normalize_slice_id(slice_num)?;
-                self.dsperse.resolve_component(sha, &slice_id).await?
+                // Prefer the slice from the correct circuit's model directory to
+                // avoid reusing a component from a different model that shares the
+                // same component SHA but was compiled with different input dimensions.
+                let preferred = (!circuit_id.is_empty()).then(|| {
+                    self.dsperse
+                        .cache_dir()
+                        .join(format!("model_{circuit_id}"))
+                        .join("slices")
+                        .join(&slice_id)
+                });
+                let use_preferred = preferred.as_ref().is_some_and(|p| {
+                    let stamp_ok = std::fs::read_to_string(p.join("component.sha"))
+                        .is_ok_and(|s| s.trim() == sha);
+                    let bundle_ok = p.join("jstprove").join("circuit.bundle").is_dir();
+                    stamp_ok && bundle_ok
+                });
+                if use_preferred {
+                    preferred
+                } else {
+                    self.dsperse.resolve_component(sha, &slice_id).await?
+                }
             }
             None => None,
         };
