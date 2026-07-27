@@ -29,6 +29,7 @@ mod cli;
 mod dsperse;
 mod firewall;
 mod handlers;
+mod heavy_slices;
 mod lightning_server;
 mod nftables;
 mod roster;

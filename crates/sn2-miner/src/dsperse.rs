@@ -328,6 +328,16 @@ impl DSperseClient {
         // resolved_component_dir already contains the canonical slice path.
         let _ = normalize_slice_id(slice_num)?;
 
+        // Decline known-heavy slices before touching disk or CPU at all --
+        // see heavy_slices.rs for why this is a static lookup rather than
+        // a live estimate, and why declining fast beats attempting and
+        // either timing out or dragging out a slot for tens of seconds.
+        anyhow::ensure!(
+            !crate::heavy_slices::is_heavy_slice(slice_num),
+            "declining known heavy slice '{slice_num}' (>= {} constraints)",
+            crate::heavy_slices::HEAVY_SLICE_CONSTRAINT_THRESHOLD
+        );
+
         let slice_dir = resolved_component_dir;
 
         anyhow::ensure!(
