@@ -88,6 +88,18 @@ pub struct ProveArtifacts {
     pub computed_outputs: Vec<f64>,
 }
 
+/// Per-stage wall-clock breakdown for one `prove`/`prove_slice` call, logged
+/// alongside the request so a slow round-trip can be attributed to a specific
+/// stage (circuit bundle load, WAI activation/initializer classification,
+/// witness generation, proof generation) instead of only an aggregate time.
+#[derive(Debug, Clone, Copy)]
+struct StageTimings {
+    load_params_ms: f64,
+    classify_ms: f64,
+    witness_ms: f64,
+    prove_ms: f64,
+}
+
 fn prove_and_build_response(
     backend: &dsperse::backend::jstprove::JstproveBackend,
     circuit_path: &Path,
@@ -201,6 +213,7 @@ impl DSperseClient {
         component_sha: &str,
         slice_id: &str,
     ) -> Result<Option<PathBuf>> {
+        let start = std::time::Instant::now();
         let cache_key = (component_sha.to_string(), slice_id.to_string());
 
         if let Some(cached) = self
@@ -211,6 +224,13 @@ impl DSperseClient {
             .cloned()
         {
             if cached.join("jstprove").join("circuit.bundle").is_dir() {
+                info!(
+                    component_sha,
+                    slice_id,
+                    cache_hit = true,
+                    elapsed_ms = start.elapsed().as_secs_f64() * 1000.0,
+                    "component resolved"
+                );
                 return Ok(Some(cached));
             }
             // Stale (e.g. evicted from disk since caching) -- drop it and
@@ -264,6 +284,15 @@ impl DSperseClient {
         .await
         .context("component resolution task panicked")??;
 
+        info!(
+            component_sha,
+            slice_id,
+            cache_hit = false,
+            elapsed_ms = start.elapsed().as_secs_f64() * 1000.0,
+            found = resolved.is_some(),
+            "component resolved"
+        );
+
         if let Some(ref slice_dir) = resolved {
             self.component_cache
                 .write()
@@ -298,22 +327,49 @@ impl DSperseClient {
         let inputs_clone = inputs.clone();
         let backend = Arc::clone(&self.backend);
 
-        tokio::task::spawn_blocking(move || -> Result<ProveArtifacts> {
-            let inputs_bytes = rmp_serde::to_vec_named(&inputs_clone)?;
+        let (result, timings) = tokio::task::spawn_blocking(
+            move || -> Result<(ProveArtifacts, StageTimings)> {
+                let inputs_bytes = rmp_serde::to_vec_named(&inputs_clone)?;
 
-            let params = backend
-                .load_params(&circuit_path)
-                .map_err(|e| anyhow::anyhow!("loading circuit params: {e}"))?;
+                let t = std::time::Instant::now();
+                let params = backend
+                    .load_params(&circuit_path)
+                    .map_err(|e| anyhow::anyhow!("loading circuit params: {e}"))?;
+                let load_params_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-            let witness_bytes = backend
-                .witness(&circuit_path, &inputs_bytes, &[])
-                .map_err(|e| anyhow::anyhow!("witness generation: {e}"))?;
+                let t = std::time::Instant::now();
+                let witness_bytes = backend
+                    .witness(&circuit_path, &inputs_bytes, &[])
+                    .map_err(|e| anyhow::anyhow!("witness generation: {e}"))?;
+                let witness_ms = t.elapsed().as_secs_f64() * 1000.0;
 
-            let dims = params.as_ref().map(|p| p.effective_input_dims());
-            prove_and_build_response(&backend, &circuit_path, &witness_bytes, dims)
-        })
+                let dims = params.as_ref().map(|p| p.effective_input_dims());
+                let t = std::time::Instant::now();
+                let artifacts = prove_and_build_response(&backend, &circuit_path, &witness_bytes, dims)?;
+                let prove_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+                Ok((
+                    artifacts,
+                    StageTimings {
+                        load_params_ms,
+                        classify_ms: 0.0,
+                        witness_ms,
+                        prove_ms,
+                    },
+                ))
+            },
+        )
         .await
-        .context("blocking task panicked")?
+        .context("blocking task panicked")??;
+
+        info!(
+            model_id,
+            load_params_ms = timings.load_params_ms,
+            witness_ms = timings.witness_ms,
+            prove_ms = timings.prove_ms,
+            "prove stage timing"
+        );
+        Ok(result)
     }
 
     pub async fn prove_slice(
@@ -361,16 +417,21 @@ impl DSperseClient {
         let backend = Arc::clone(&self.backend);
         let onnx_initializers_cache = Arc::clone(&self.onnx_initializers_cache);
 
-        tokio::task::spawn_blocking(move || -> Result<ProveArtifacts> {
+        let (result, timings) = tokio::task::spawn_blocking(
+            move || -> Result<(ProveArtifacts, StageTimings)> {
             let input_flat = flatten_json_to_f64(&input_data);
             anyhow::ensure!(
                 !input_flat.is_empty(),
                 "invalid input tensor: flattened input is empty"
             );
 
+            let t = std::time::Instant::now();
             let params = backend
                 .load_params(&circuit_path)
                 .map_err(|e| anyhow::anyhow!("loading circuit params: {e}"))?;
+            let load_params_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+            let t = std::time::Instant::now();
             let (activations, inits) = match params.as_ref() {
                 Some(p) if p.weights_as_inputs => {
                     match dsperse::pipeline::split_inline_wai_inputs(p, &input_flat) {
@@ -443,22 +504,109 @@ impl DSperseClient {
                                 inits.extend(file_inits);
                             }
 
+                            // Mirror jstprove_circuits' own positional split
+                            // (witness_from_f64_generic in onnx.rs):
+                            //   num_activation_entries = inputs.len() - initializers.len()
+                            //   expected_activation_elems = sum(shapes of the
+                            //     first num_activation_entries inputs)
+                            // It has no notion of names -- it just assumes
+                            // however many inputs aren't covered by
+                            // `initializers` must be activation-sourced, in
+                            // declared order. `extract_onnx_initializers`
+                            // silently drops any name it can't match in the
+                            // donor ONNX (no error), which can leave `inits`
+                            // one short of what jstprove implicitly expects
+                            // -- inflating num_activation_entries and pulling
+                            // an extra leading input's shape into
+                            // expected_activation_elems. That surfaces two
+                            // crates away as a bare "activation length
+                            // mismatch: expected X, got Y" with none of this
+                            // context. Catch it here instead, with the exact
+                            // declared input(s) responsible: the failure
+                            // observed in production splits 2x cleanly
+                            // (e.g. expected 1536, got 768) because the
+                            // silently-dropped name's own declared shape
+                            // exactly matches the activation payload size --
+                            // consistent with a donor-sourced circuit
+                            // declaring the same activation tensor twice
+                            // under a second, unnamed ONNX node ID that
+                            // `is_activation_placeholder` doesn't recognize
+                            // and the donor file doesn't actually contain.
+                            let num_activation_entries = p.inputs.len().saturating_sub(inits.len());
+                            let expected_activation_elems: usize = p.inputs
+                                [..num_activation_entries]
+                                .iter()
+                                .map(|io| io.shape.iter().product::<usize>())
+                                .sum();
+                            if activations.len() != expected_activation_elems {
+                                let disputed: Vec<String> = p.inputs[..num_activation_entries]
+                                    .iter()
+                                    .filter(|io| {
+                                        !dsperse::pipeline::runner::is_activation_placeholder(
+                                            &io.name,
+                                        )
+                                    })
+                                    .map(|io| {
+                                        format!("{}[{}]", io.name, io.shape.iter().product::<usize>())
+                                    })
+                                    .collect();
+                                anyhow::bail!(
+                                    "activation/initializer split disagrees with jstprove's \
+                                     positional formula: this code built {} activation element(s) \
+                                     but jstprove expects {} (given {} initializer(s) of {} total \
+                                     declared inputs); leading input(s) not recognized as \
+                                     activation by name -- candidates for \
+                                     wai_duplicate_activations.rs: [{}]",
+                                    activations.len(),
+                                    expected_activation_elems,
+                                    inits.len(),
+                                    p.inputs.len(),
+                                    disputed.join(", ")
+                                );
+                            }
+
                             (activations, inits)
                         }
                     }
                 }
                 _ => (input_flat.clone(), Vec::new()),
             };
+            let classify_ms = t.elapsed().as_secs_f64() * 1000.0;
 
+            let t = std::time::Instant::now();
             let witness_bytes = backend
                 .witness_f64(&circuit_path, &activations, &inits)
                 .map_err(|e| anyhow::anyhow!("witness generation: {e}"))?;
+            let witness_ms = t.elapsed().as_secs_f64() * 1000.0;
 
             let dims = params.as_ref().map(|p| p.effective_input_dims());
-            prove_and_build_response(&backend, &circuit_path, &witness_bytes, dims)
+            let t = std::time::Instant::now();
+            let artifacts = prove_and_build_response(&backend, &circuit_path, &witness_bytes, dims)?;
+            let prove_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+            Ok((
+                artifacts,
+                StageTimings {
+                    load_params_ms,
+                    classify_ms,
+                    witness_ms,
+                    prove_ms,
+                },
+            ))
         })
         .await
-        .context("blocking task panicked")?
+        .context("blocking task panicked")??;
+
+        info!(
+            circuit_id,
+            slice = slice_num,
+            load_params_ms = timings.load_params_ms,
+            classify_ms = timings.classify_ms,
+            witness_ms = timings.witness_ms,
+            prove_ms = timings.prove_ms,
+            "prove_slice stage timing"
+        );
+        Ok(result)
     }
 }
 
