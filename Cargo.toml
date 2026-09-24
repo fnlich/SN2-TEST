@@ -24,7 +24,7 @@ members = [
     "crates/sn2-validator",
     "crates/sn2-miner",
 ]
-exclude = ["fuzz"]
+exclude = ["fuzz", "vendor/btlightning"]
 resolver = "2"
 
 [workspace.package]
@@ -79,3 +79,8 @@ ndarray = { version = "0.17", features = ["serde"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 bittensor-drand = { git = "https://github.com/inference-labs-inc/bittensor-drand.git", rev = "e55ed98", default-features = false }
 
+# btlightning 0.2.15 with a server-side fix: a validator's authenticated QUIC
+# connection stays authenticated when its client address changes (NAT
+# rebinding / QUIC path migration). See vendor/btlightning/PATCHED.md.
+[patch.crates-io]
+btlightning = { path = "vendor/btlightning" }
