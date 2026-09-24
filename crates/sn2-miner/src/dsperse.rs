@@ -31,7 +31,7 @@ pub struct DSperseClient {
     /// and re-parsing the same donor ONNX file on every repeat request
     /// for that slice is pure waste. `Arc`-wrapped since it's read and
     /// populated from inside `spawn_blocking`, not just `&self` methods.
-    onnx_initializers_cache: Arc<RwLock<HashMap<PathBuf, Vec<(Vec<f64>, Vec<usize>)>>>>,
+    onnx_initializers_cache: Arc<RwLock<HashMap<PathBuf, Vec<Initializer>>>>,
     /// Caches the whole-model-onnx WAI initializer fallback (see
     /// `prove_slice`'s unresolved-name handling), keyed by the
     /// whole-model `model.onnx` path and shared across every slice of
@@ -48,15 +48,16 @@ pub struct DSperseClient {
     /// measured at 2+ seconds. See `resolve_whole_model_initializers`
     /// for why a failed parse is deliberately evicted rather than left
     /// permanently cached in the `OnceLock`.
-    whole_model_initializers_cache: Arc<
-        RwLock<HashMap<PathBuf, Arc<WholeModelOnceCell>>>,
-    >,
+    whole_model_initializers_cache: Arc<RwLock<HashMap<PathBuf, Arc<WholeModelOnceCell>>>>,
 }
 
 /// `OnceLock` value for `whole_model_initializers_cache` -- `None` means a
 /// parse was attempted and failed (see `resolve_whole_model_initializers`
 /// for why that state is evicted rather than left permanently cached).
-type WholeModelOnceCell = std::sync::OnceLock<Option<Arc<HashMap<String, (Vec<f64>, Vec<usize>)>>>>;
+/// One ONNX initializer tensor: flattened f64 values and its shape.
+type Initializer = (Vec<f64>, Vec<usize>);
+
+type WholeModelOnceCell = std::sync::OnceLock<Option<Arc<HashMap<String, Initializer>>>>;
 
 fn validate_circuit_id(id: &str) -> Result<()> {
     anyhow::ensure!(
@@ -105,9 +106,7 @@ fn find_slice_onnx(slice_dir: &Path) -> Result<PathBuf> {
 /// file from disk on every call. Built from dsperse's public
 /// `slicer::onnx_proto` primitives, the only ones exposed at this crate
 /// rev for a full (unfiltered) name -> tensor map.
-fn load_whole_model_initializer_map(
-    path: &Path,
-) -> Result<HashMap<String, (Vec<f64>, Vec<usize>)>> {
+fn load_whole_model_initializer_map(path: &Path) -> Result<HashMap<String, Initializer>> {
     use dsperse::slicer::onnx_proto::TensorProto;
 
     let model = dsperse::slicer::onnx_proto::load_model(path)
@@ -173,7 +172,7 @@ fn load_whole_model_initializer_map(
 fn resolve_whole_model_initializers(
     cache: &RwLock<HashMap<PathBuf, Arc<WholeModelOnceCell>>>,
     whole_model_path: &Path,
-) -> Option<Arc<HashMap<String, (Vec<f64>, Vec<usize>)>>> {
+) -> Option<Arc<HashMap<String, Initializer>>> {
     // Bound to its own `let` rather than used directly as a `match`
     // scrutinee: a match scrutinee's temporaries (including this read
     // guard) live for the whole match, not just the scrutinee -- calling
@@ -197,17 +196,19 @@ fn resolve_whole_model_initializers(
     };
 
     let result = cell
-        .get_or_init(|| match load_whole_model_initializer_map(whole_model_path) {
-            Ok(map) => Some(Arc::new(map)),
-            Err(e) => {
-                tracing::warn!(
-                    path = %whole_model_path.display(),
-                    error = %e,
-                    "failed to parse whole-model onnx for WAI fallback"
-                );
-                None
-            }
-        })
+        .get_or_init(
+            || match load_whole_model_initializer_map(whole_model_path) {
+                Ok(map) => Some(Arc::new(map)),
+                Err(e) => {
+                    tracing::warn!(
+                        path = %whole_model_path.display(),
+                        error = %e,
+                        "failed to parse whole-model onnx for WAI fallback"
+                    );
+                    None
+                }
+            },
+        )
         .clone();
 
     if result.is_none() {
@@ -299,13 +300,13 @@ impl DSperseClient {
         {
             let backend = Arc::clone(&backend);
             tokio::spawn(async move {
-                let mut interval =
-                    tokio::time::interval(Duration::from_secs(sn2_types::BUNDLE_CACHE_IDLE_TTL_SECS));
+                let mut interval = tokio::time::interval(Duration::from_secs(
+                    sn2_types::BUNDLE_CACHE_IDLE_TTL_SECS,
+                ));
                 loop {
                     interval.tick().await;
-                    let evicted = backend.evict_idle(Duration::from_secs(
-                        sn2_types::BUNDLE_CACHE_IDLE_TTL_SECS,
-                    ));
+                    let evicted = backend
+                        .evict_idle(Duration::from_secs(sn2_types::BUNDLE_CACHE_IDLE_TTL_SECS));
                     if evicted > 0 {
                         info!(evicted, "evicted idle compiled circuit bundles");
                     }
@@ -387,8 +388,8 @@ impl DSperseClient {
         // available for free here -- priming onnx_cache with it saves
         // prove_slice's later resolve_slice_onnx call from re-listing the
         // exact same payload/ directory it was just computed from.
-        let resolved: Option<(PathBuf, PathBuf)> = tokio::task::spawn_blocking(
-            move || -> Result<Option<(PathBuf, PathBuf)>> {
+        let resolved: Option<(PathBuf, PathBuf)> =
+            tokio::task::spawn_blocking(move || -> Result<Option<(PathBuf, PathBuf)>> {
                 let entries = match std::fs::read_dir(&cache_dir) {
                     Ok(e) => e,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -425,10 +426,9 @@ impl DSperseClient {
                     }
                 }
                 Ok(None)
-            },
-        )
-        .await
-        .context("component resolution task panicked")??;
+            })
+            .await
+            .context("component resolution task panicked")??;
 
         if let Some((ref slice_dir, ref onnx_path)) = resolved {
             self.component_cache
