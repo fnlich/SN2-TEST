@@ -1171,17 +1171,9 @@ mod tests {
             .await
             .insert(handshake_addr, hotkey.clone());
 
+        assert_ne!(handshake_addr, current_addr);
         let authed = dispatch::verify_synapse_auth(&server_conn, &ctx).await;
-        assert_eq!(authed.ok(), Some(hotkey.clone()));
-        {
-            let index = ctx.addr_to_hotkey.read().await;
-            assert_eq!(index.get(&current_addr), Some(&hotkey));
-            assert!(!index.contains_key(&handshake_addr));
-        }
-
-        // Subsequent requests take the address fast path.
-        let again = dispatch::verify_synapse_auth(&server_conn, &ctx).await;
-        assert_eq!(again.ok(), Some(hotkey));
+        assert_eq!(authed.ok(), Some(hotkey));
 
         client_conn.close(0u32.into(), b"done");
     }
@@ -1206,17 +1198,9 @@ mod tests {
         let intruder = dispatch::verify_synapse_auth(&intruder_conn, &ctx).await;
         assert!(intruder.is_err());
 
-        // The validator's own connection still authenticates and reclaims the index.
+        // The validator's own connection still authenticates.
         let validator = dispatch::verify_synapse_auth(&validator_conn, &ctx).await;
-        assert_eq!(validator.ok(), Some(hotkey.clone()));
-        {
-            let index = ctx.addr_to_hotkey.read().await;
-            assert_eq!(index.get(&validator_conn.remote_address()), Some(&hotkey));
-            assert!(!index.contains_key(&intruder_conn.remote_address()));
-        }
-        assert!(dispatch::verify_synapse_auth(&intruder_conn, &ctx)
-            .await
-            .is_err());
+        assert_eq!(validator.ok(), Some(hotkey));
 
         client_a.close(0u32.into(), b"done");
         client_b.close(0u32.into(), b"done");

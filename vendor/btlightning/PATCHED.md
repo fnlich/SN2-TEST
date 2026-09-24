@@ -27,12 +27,9 @@ shared NAT) would have been treated as the validator without a handshake.
 ## What changed
 
 - `src/server/dispatch.rs` `verify_synapse_auth`: authentication is bound to the
-  connection object. An address hit is honored only if it resolves to this very
-  connection. On a miss, the verified connection is found by identity and the
-  address index is re-keyed to its current address, dropping the validator's
-  other addresses. The re-key runs once per address change, even with many
-  requests in flight, and logs `re-keyed authenticated connection after its
-  client address changed (QUIC path migration)` with the old and new address.
+  connection object and the client address is not consulted at all. A request
+  is served only if it arrives on the verified connection that completed the
+  handshake, however many times that connection's address has changed.
 - `src/server/handshake.rs`: a successful handshake drops every other address
   the index holds for that validator, not only the replaced connection's current
   one. This covers a re-handshake on a connection that had migrated.
@@ -42,10 +39,8 @@ shared NAT) would have been treated as the validator without a handshake.
 - Unit tests for the above in `src/server/mod.rs`. The end-to-end NAT rebinding
   test lives in `crates/sn2-miner/tests/quic_nat_rebind.rs`.
 
-Behavior to be aware of: the source-address allowlist (`enforce_source_allowlist`)
-and the handshake observer only act when a connection is accepted or handshakes.
-An authenticated connection that migrates, including to a different IP, keeps
-being served, and the observer is not told about the new address. Only the
+Behavior to be aware of: an authenticated connection that migrates, including
+to a different IP, keeps being served. Only the
 holder of the connection's QUIC keys can move it, so this is not an
 authentication bypass.
 

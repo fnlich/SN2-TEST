@@ -228,97 +228,31 @@ async fn handle_stream(
 }
 
 /// Authentication belongs to the QUIC connection that completed the
-/// handshake, not to the client address it used at the time. quinn leaves
-/// server-side connection migration on, so a NAT rebinding (common on shared
-/// egress such as Cloudflare WARP) moves a live, already-authenticated
-/// connection to a new source port. The address index is only a fast path:
-/// a hit must resolve to this very connection, and a miss falls back to an
-/// identity match that re-keys the index to the connection's current address.
+/// handshake. The client address is not consulted: quinn leaves server-side
+/// connection migration on, so a NAT rebinding (common on shared egress such
+/// as Cloudflare WARP) can move a live, authenticated connection to a new
+/// address, and a different peer can later be handed the old one.
 pub(super) async fn verify_synapse_auth(
     connection: &Arc<quinn::Connection>,
     ctx: &ServerContext,
 ) -> std::result::Result<String, SynapseResponse> {
-    let remote_addr = connection.remote_address();
-    let indexed_hotkey = ctx.addr_to_hotkey.read().await.get(&remote_addr).cloned();
-
-    if let Some(hotkey) = indexed_hotkey {
-        let connections_guard = ctx.connections.read().await;
-        if let Some(conn) = connections_guard.get(&hotkey) {
-            // An address index entry can outlive the connection it was
-            // recorded for (the connection migrated away and another peer
-            // behind the same NAT was later handed that port), so only
-            // trust it when it points back at this connection.
-            if Arc::ptr_eq(&conn.connection, connection) {
-                if !conn.is_verified() {
-                    error!("Connection not verified for validator: {}", hotkey);
-                    return Err(error_synapse_response("authentication failed"));
-                }
-                conn.update_activity();
-                return Ok(hotkey);
-            }
-        }
-    }
-
-    match rekey_migrated_connection(connection, ctx).await {
-        Some(hotkey) => Ok(hotkey),
-        None => {
-            error!("Unknown or unauthenticated connection from {}", remote_addr);
-            Err(error_synapse_response("authentication failed"))
-        }
-    }
-}
-
-/// Finds the validator whose authenticated connection is `connection` and
-/// points the address index at the connection's current address, dropping any
-/// other address the index still holds for that validator so a recycled port
-/// cannot inherit it.
-async fn rekey_migrated_connection(
-    connection: &Arc<quinn::Connection>,
-    ctx: &ServerContext,
-) -> Option<String> {
     let connections_guard = ctx.connections.read().await;
-    let (hotkey, conn) = connections_guard
+    let Some((hotkey, conn)) = connections_guard
         .iter()
-        .find(|(_, c)| Arc::ptr_eq(&c.connection, connection))?;
+        .find(|(_, c)| Arc::ptr_eq(&c.connection, connection))
+    else {
+        error!(
+            "Unknown or unauthenticated connection from {}",
+            connection.remote_address()
+        );
+        return Err(error_synapse_response("authentication failed"));
+    };
     if !conn.is_verified() {
-        return None;
+        error!("Connection not verified for validator: {}", hotkey);
+        return Err(error_synapse_response("authentication failed"));
     }
     conn.update_activity();
-    let hotkey = hotkey.clone();
-
-    let mut addr_index = ctx.addr_to_hotkey.write().await;
-    // Read the address under the write lock: concurrent requests on the same
-    // connection all miss the fast path after a migration, and the connection
-    // may have moved again since the caller looked. Only the first one re-keys.
-    let current_addr = connection.remote_address();
-    if addr_index.get(&current_addr) == Some(&hotkey) {
-        return Some(hotkey);
-    }
-    let previous_addr = addr_index
-        .iter()
-        .find(|(addr, hk)| **hk == hotkey && **addr != current_addr)
-        .map(|(addr, _)| *addr);
-    addr_index.retain(|addr, hk| *hk != hotkey || *addr == current_addr);
-    addr_index.insert(current_addr, hotkey.clone());
-    drop(addr_index);
-    drop(connections_guard);
-
-    match previous_addr {
-        Some(old_addr) => info!(
-            validator = %hotkey,
-            %old_addr,
-            new_addr = %current_addr,
-            "re-keyed authenticated connection after its client address changed (QUIC path migration)"
-        ),
-        // No earlier address for this validator: another validator's handshake
-        // from the same client address had taken the index entry over.
-        None => debug!(
-            validator = %hotkey,
-            addr = %current_addr,
-            "re-keyed authenticated connection whose address entry was reassigned"
-        ),
-    }
-    Some(hotkey)
+    Ok(hotkey.clone())
 }
 
 async fn handle_streaming_synapse_with_timeout(
