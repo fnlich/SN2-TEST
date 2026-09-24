@@ -6358,13 +6358,11 @@ name = "sn2-miner"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "btlightning",
  "clap",
  "ctor",
  "dsperse",
  "mimalloc",
- "parity-scale-codec",
  "reqwest 0.12.28",
  "rmp-serde",
  "rmpv",
@@ -6376,7 +6374,6 @@ dependencies = [
  "sn2-types",
  "sp-core",
  "subxt",
- "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

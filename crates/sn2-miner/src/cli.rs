@@ -1,23 +1,8 @@
-use clap::{Parser, Subcommand};
-
-#[derive(Subcommand, Debug, Clone)]
-pub enum Command {
-    /// Emit an nftables ruleset that drops UDP traffic to the QUIC port from any
-    /// source IP not currently registered as a validator in the cached metagraph.
-    /// Pipe stdout to `sudo nft -f -` to apply atomically.
-    Firewall {
-        /// Optional path to write the ruleset to instead of stdout.
-        #[arg(long)]
-        out: Option<std::path::PathBuf>,
-    },
-}
+use clap::Parser;
 
 #[derive(Parser, Debug)]
 #[command(name = "sn2-miner", about = "Subnet-2 Miner")]
 pub struct Cli {
-    #[command(subcommand)]
-    pub command: Option<Command>,
-
     #[arg(long, default_value_t = sn2_types::DEFAULT_NETUID)]
     pub netuid: u16,
 
@@ -50,30 +35,6 @@ pub struct Cli {
 
     #[arg(long, default_value_t = false)]
     pub no_auto_update: bool,
-
-    #[arg(
-        long,
-        default_value_t = false,
-        help = "[TESTING ONLY] Disable validator permit checks — bypasses all on-chain permit enforcement"
-    )]
-    pub disable_blacklist: bool,
-
-    #[arg(
-        long,
-        default_value_t = false,
-        help = "Do not load the persisted validator roster on startup. New observations still persist unless --no-validator-ip-cache is combined with a read-only wallet path."
-    )]
-    pub no_validator_ip_cache: bool,
-
-    #[arg(
-        long,
-        default_value_t = false,
-        help = "Disable nftables ruleset emission. The userspace source-IP check at the QUIC listener remains in effect."
-    )]
-    pub no_nftables: bool,
-
-    #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(30..), help = "Metagraph sync interval in seconds")]
-    pub metagraph_sync_interval: u64,
 
     #[arg(
         long,
