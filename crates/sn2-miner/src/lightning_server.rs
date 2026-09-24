@@ -6,8 +6,11 @@ use tracing::info;
 
 use sn2_types::*;
 
-use crate::allowlist::ValidatorAllowlist;
 use crate::handlers::MinerHandlers;
+
+/// The only validator hotkey this miner serves. Handshakes from any other
+/// hotkey are rejected; the peer's IP address and port are not checked.
+pub const ALLOWED_VALIDATOR_HOTKEY: &str = "5CFxLBvpyQq3TCP7zLcu8dLcPBxhA6MdLvXiCyvJVojuK17J";
 
 pub async fn run_lightning_server(
     miner_hotkey: &str,
@@ -18,17 +21,14 @@ pub async fn run_lightning_server(
     port: u16,
     handler_timeout_secs: u64,
     handlers: Arc<MinerHandlers>,
-    allowlist: Option<Arc<ValidatorAllowlist>>,
+    restrict_to_allowed_validator: bool,
 ) -> Result<()> {
     let idle_timeout = handler_timeout_secs.saturating_mul(2).max(150);
-    let require_validator_permit = allowlist.is_some();
-    let enforce_source_allowlist = allowlist.is_some();
     let config = LightningServerConfig::builder()
         .handler_timeout_secs(handler_timeout_secs)
         .idle_timeout_secs(idle_timeout)
         .max_frame_payload_bytes(sn2_types::TRANSPORT_PAYLOAD_LIMIT)
-        .require_validator_permit(require_validator_permit)
-        .enforce_source_allowlist(enforce_source_allowlist)
+        .require_validator_permit(restrict_to_allowed_validator)
         .require_address_validation(true)
         .build()?;
     let mut server =
@@ -36,17 +36,11 @@ pub async fn run_lightning_server(
 
     server.set_miner_wallet(wallet_name, wallet_path, hotkey_name)?;
 
-    if let Some(allowlist) = allowlist {
-        // The allowlist implements all three traits: ValidatorPermitResolver
-        // (handshake-time hotkey check), SourceAddressResolver (QUIC-listener
-        // source-IP drop), and HandshakeObserver (trust-on-first-use roster
-        // updates). Cloning the Arc keeps a single shared state machine across
-        // all three roles.
-        server.set_validator_permit_resolver(Box::new(arc_as_boxed_permit(allowlist.clone())));
-        server.set_source_address_resolver(Box::new(arc_as_boxed_source(allowlist.clone())));
-        server.set_handshake_observer(allowlist);
+    if restrict_to_allowed_validator {
+        server.set_validator_permit_resolver(Box::new(AllowedValidator));
         info!(
-            "Validator allowlist active: permit enforcement at handshake, trust-on-first-use source-IP allowlist gated by stake-weighted coverage"
+            validator = ALLOWED_VALIDATOR_HOTKEY,
+            "accepting handshakes from a single validator hotkey"
         );
     }
 
@@ -91,30 +85,25 @@ pub async fn run_lightning_server(
     Ok(())
 }
 
-/// Trait adapter: the lightning server's permit/source resolver setters take
-/// `Box<dyn Trait>`, but ValidatorAllowlist is owned through `Arc` so the same
-/// state machine drives all three behaviors. These thin wrappers forward the
-/// trait calls to the shared Arc.
-struct ArcPermitResolver(Arc<ValidatorAllowlist>);
-impl btlightning::ValidatorPermitResolver for ArcPermitResolver {
+struct AllowedValidator;
+
+impl btlightning::ValidatorPermitResolver for AllowedValidator {
     fn resolve_permitted_validators(
         &self,
     ) -> btlightning::Result<std::collections::HashSet<String>> {
-        self.0.resolve_permitted_validators()
+        Ok([ALLOWED_VALIDATOR_HOTKEY.to_string()].into())
     }
 }
 
-struct ArcSourceResolver(Arc<ValidatorAllowlist>);
-impl btlightning::SourceAddressResolver for ArcSourceResolver {
-    fn resolve_allowed_sources(&self) -> btlightning::Result<btlightning::SourceAllowlist> {
-        self.0.resolve_allowed_sources()
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use btlightning::ValidatorPermitResolver;
+
+    #[test]
+    fn only_the_allowed_validator_is_permitted() {
+        let permitted = AllowedValidator.resolve_permitted_validators().unwrap();
+        assert_eq!(permitted.len(), 1);
+        assert!(permitted.contains("5CFxLBvpyQq3TCP7zLcu8dLcPBxhA6MdLvXiCyvJVojuK17J"));
     }
-}
-
-fn arc_as_boxed_permit(arc: Arc<ValidatorAllowlist>) -> ArcPermitResolver {
-    ArcPermitResolver(arc)
-}
-
-fn arc_as_boxed_source(arc: Arc<ValidatorAllowlist>) -> ArcSourceResolver {
-    ArcSourceResolver(arc)
 }

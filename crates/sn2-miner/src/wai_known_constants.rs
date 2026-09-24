@@ -9,7 +9,10 @@ use std::sync::LazyLock;
 /// miner never runs for donor-sourced weights-as-inputs circuits. Recovered
 /// once offline from the base model and its frozen backbone, keyed by the
 /// exact tensor name the compiled circuit declares.
-static KNOWN_CONSTANTS: LazyLock<HashMap<String, (Vec<usize>, Vec<f64>)>> = LazyLock::new(|| {
+/// A known constant tensor: its shape and flattened f64 values.
+type KnownConstant = (Vec<usize>, Vec<f64>);
+
+static KNOWN_CONSTANTS: LazyLock<HashMap<String, KnownConstant>> = LazyLock::new(|| {
     let raw: serde_json::Value =
         serde_json::from_str(include_str!("../data/wai_known_constants.json"))
             .expect("wai_known_constants.json must parse as JSON");
@@ -64,9 +67,8 @@ mod tests {
 
     #[test]
     fn known_bias_tensor_resolves_with_correct_length() {
-        let (values, shape) =
-            lookup("backbone.0.encoder.encoder.encoder.layer.8.mlp.fc1.bias")
-                .expect("layer 8 fc1 bias must be present");
+        let (values, shape) = lookup("backbone.0.encoder.encoder.encoder.layer.8.mlp.fc1.bias")
+            .expect("layer 8 fc1 bias must be present");
         assert_eq!(shape, vec![1536]);
         assert_eq!(values.len(), 1536);
     }

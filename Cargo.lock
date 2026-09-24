@@ -886,8 +886,6 @@ dependencies = [
 [[package]]
 name = "btlightning"
 version = "0.2.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "14a38bfc8fb8f0acf342b4bf5fa227aa89342251fcb6ba390e3a5b186577ab95"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -6360,23 +6358,22 @@ name = "sn2-miner"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "btlightning",
  "clap",
  "ctor",
  "dsperse",
  "mimalloc",
- "parity-scale-codec",
  "reqwest 0.12.28",
  "rmp-serde",
+ "rmpv",
  "rustls",
  "serde_json",
  "shellexpand",
  "sn2-chain",
  "sn2-circuit-store",
  "sn2-types",
+ "sp-core",
  "subxt",
- "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

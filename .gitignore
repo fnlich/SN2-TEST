@@ -23,3 +23,5 @@ scores.pt
 
 .idea/
 .pytest_cache/
+
+vendor/btlightning/Cargo.lock

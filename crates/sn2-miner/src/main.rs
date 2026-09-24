@@ -24,28 +24,22 @@ fn configure_mimalloc_purge_delay() {
     }
 }
 
-mod allowlist;
 mod cli;
 mod dsperse;
-mod firewall;
 mod handlers;
 mod lightning_server;
-mod nftables;
-mod roster;
 mod wai_known_constants;
 
 use std::net::IpAddr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::watch;
-use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
-use crate::cli::{Cli, Command};
+use crate::cli::Cli;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -58,17 +52,6 @@ async fn main() -> Result<()> {
     sn2_types::init_tracing(&cli.log_level);
 
     info!(version = sn2_types::SOFTWARE_VERSION, "sn2-miner");
-
-    if let Some(Command::Firewall { out }) = cli.command.clone() {
-        return firewall::emit_nftables(
-            cli.netuid,
-            &cli.network,
-            cli.subtensor_chain_endpoint.as_deref(),
-            cli.axon_port,
-            out,
-        )
-        .await;
-    }
 
     if cli.loopback {
         return run_loopback(cli).await;
@@ -118,8 +101,6 @@ async fn main() -> Result<()> {
         cli.network,
     );
 
-    let metagraph = Arc::new(RwLock::new(metagraph));
-
     let external_ip = match resolve_external_ip(cli.external_ip.as_deref()).await {
         Ok(ip) => Some(ip),
         Err(e) if cli.external_ip.is_none() => {
@@ -148,39 +129,12 @@ async fn main() -> Result<()> {
     let handlers = std::sync::Arc::new(handlers);
 
     let handler_timeout = cli.handler_timeout;
-    let allowlist: Option<Arc<allowlist::ValidatorAllowlist>> = if cli.disable_blacklist {
-        warn!("--disable-blacklist set; validator allowlist is bypassed (TESTING ONLY)");
-        None
-    } else {
-        let cache_policy = if cli.no_validator_ip_cache {
-            allowlist::CachePolicy::InMemoryOnly
-        } else {
-            allowlist::CachePolicy::PersistToDisk
-        };
-        Some(Arc::new(
-            allowlist::ValidatorAllowlist::new(
-                metagraph.clone(),
-                cli.netuid,
-                std::path::PathBuf::from(wallet.wallet_path.as_str()),
-                cache_policy,
-            )
-            .context("initializing validator allowlist")?,
-        ))
-    };
-
-    let nftables_manager = if cli.no_nftables || allowlist.is_none() {
-        None
-    } else {
-        Some(Arc::new(nftables::NftablesManager::new(quic_port)))
-    };
-
     let quic_handle = {
         let handlers = handlers.clone();
         let hotkey = wallet.hotkey_ss58().to_string();
         let w_name = wallet.name.clone();
         let w_path = wallet.wallet_path.clone();
         let w_hotkey = wallet.hotkey_name.clone();
-        let allowlist = allowlist.clone();
         tokio::spawn(async move {
             lightning_server::run_lightning_server(
                 &hotkey,
@@ -191,7 +145,7 @@ async fn main() -> Result<()> {
                 quic_port,
                 handler_timeout,
                 handlers,
-                allowlist,
+                true,
             )
             .await
         })
@@ -215,54 +169,11 @@ async fn main() -> Result<()> {
         "miner running"
     );
 
-    let metagraph_sync = {
-        let meta = metagraph.clone();
-        let client = chain_client.clone();
-        let netuid = cli.netuid;
-        let sync_interval = cli.metagraph_sync_interval;
-        let allowlist = allowlist.clone();
-        let nftables_manager = nftables_manager.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(std::time::Duration::from_secs(sync_interval)).await;
-                let mut fresh = sn2_chain::Metagraph::new(netuid);
-                match fresh.sync(&client).await {
-                    Ok(()) => {
-                        *meta.write().await = fresh;
-                        if let Some(al) = allowlist.as_ref() {
-                            let cov = al.evaluate().await;
-                            if let Some(nft) = nftables_manager.as_ref() {
-                                nft.apply(cov.enforcing, &cov.allowed_ips).await;
-                            }
-                            info!(
-                                enforcing = cov.enforcing,
-                                coverage_pct = cov.fraction() * 100.0,
-                                kappa_pct = cov.kappa_fraction() * 100.0,
-                                blocks_since_start = cov.blocks_since_start,
-                                tempo = cov.tempo,
-                                "validator allowlist evaluated"
-                            );
-                        }
-                    }
-                    Err(e) => {
-                        warn!(error = %e, "metagraph sync failed, retaining previous state");
-                    }
-                }
-            }
-        })
-    };
-
     let mut sigterm = signal(SignalKind::terminate()).context("registering SIGTERM handler")?;
 
     tokio::select! {
         r = quic_handle => {
             r?.context("QUIC server")?;
-        }
-        r = metagraph_sync => {
-            match r {
-                Ok(()) => warn!("metagraph sync loop exited unexpectedly"),
-                Err(e) => error!(error = %e, "metagraph sync task panicked"),
-            }
         }
         _ = tokio::signal::ctrl_c() => {
             info!("shutting down miner");
@@ -273,10 +184,6 @@ async fn main() -> Result<()> {
         _ = async { loop { shutdown_rx.changed().await.ok()?; if *shutdown_rx.borrow() { return Some(()); } } } => {
             info!("shutting down miner for auto-update restart");
         }
-    }
-
-    if let Some(nft) = nftables_manager.as_ref() {
-        nft.apply(false, &std::collections::HashSet::new()).await;
     }
 
     Ok(())
@@ -326,7 +233,7 @@ async fn run_loopback(cli: Cli) -> Result<()> {
                 port,
                 handler_timeout,
                 handlers,
-                None,
+                false,
             )
             .await
         })
