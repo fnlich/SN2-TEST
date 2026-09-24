@@ -219,7 +219,9 @@ pub(super) fn remove_hotkey_from_maps(
     hotkey: &str,
 ) -> Option<ValidatorConnection> {
     if let Some(conn) = connections.remove(hotkey) {
-        addr_to_hotkey.remove(&conn.connection.remote_address());
+        // Remove by hotkey rather than by the connection's current address: a
+        // migrated connection may have left its handshake-time address behind.
+        addr_to_hotkey.retain(|_, hk| hk != hotkey);
         Some(conn)
     } else {
         None
@@ -1007,8 +1009,9 @@ mod tests {
         assert!(nonces.contains_key("after_cutoff"));
     }
 
-    #[tokio::test]
-    async fn remove_hotkey_from_maps_cleans_both() {
+    /// Opens a real QUIC connection over loopback and returns the server side
+    /// (as the server stores it) together with the handles that keep it alive.
+    async fn quic_pair() -> (Endpoint, Endpoint, quinn::Connection, Arc<quinn::Connection>) {
         let (server_endpoint, server_addr) = {
             let (certs, key, _) = LightningServer::create_self_signed_cert().unwrap();
             let server_crypto = RustlsServerConfig::builder_with_provider(
@@ -1089,6 +1092,7 @@ mod tests {
             ep
         };
 
+        let server_endpoint_keepalive = server_endpoint.clone();
         let server_task = tokio::spawn(async move {
             let incoming = server_endpoint.accept().await.unwrap();
             Arc::new(incoming.await.unwrap())
@@ -1100,6 +1104,12 @@ mod tests {
             .await
             .unwrap();
         let server_conn = server_task.await.unwrap();
+        (server_endpoint_keepalive, client_endpoint, client_conn, server_conn)
+    }
+
+    #[tokio::test]
+    async fn remove_hotkey_from_maps_cleans_both() {
+        let (_server_endpoint, _client_endpoint, client_conn, server_conn) = quic_pair().await;
 
         let remote_addr = server_conn.remote_address();
         let hotkey = "test_validator".to_string();
@@ -1116,6 +1126,157 @@ mod tests {
         assert!(!addr_to_hotkey.contains_key(&remote_addr));
 
         client_conn.close(0u32.into(), b"done");
+    }
+
+    #[tokio::test]
+    async fn remove_hotkey_from_maps_drops_pre_migration_addresses() {
+        let (_server_endpoint, _client_endpoint, client_conn, server_conn) = quic_pair().await;
+        let hotkey = "test_validator".to_string();
+        let handshake_addr: SocketAddr = "203.0.113.7:22804".parse().unwrap();
+        let other_addr: SocketAddr = "203.0.113.8:40000".parse().unwrap();
+
+        let mut connections = HashMap::new();
+        let mut addr_to_hotkey = HashMap::new();
+        addr_to_hotkey.insert(handshake_addr, hotkey.clone());
+        addr_to_hotkey.insert(server_conn.remote_address(), hotkey.clone());
+        addr_to_hotkey.insert(other_addr, "other_validator".to_string());
+        let vc = ValidatorConnection::new(hotkey.clone(), "conn_1".into(), server_conn);
+        connections.insert(hotkey.clone(), vc);
+
+        remove_hotkey_from_maps(&mut connections, &mut addr_to_hotkey, &hotkey);
+        assert_eq!(addr_to_hotkey.len(), 1);
+        assert_eq!(
+            addr_to_hotkey.get(&other_addr).map(String::as_str),
+            Some("other_validator")
+        );
+
+        client_conn.close(0u32.into(), b"done");
+    }
+
+    #[tokio::test]
+    async fn verify_synapse_auth_follows_connection_after_address_change() {
+        let (_server_endpoint, _client_endpoint, client_conn, server_conn) = quic_pair().await;
+        let ctx = test_server_context(LightningServerConfig::default());
+        let hotkey = "test_validator".to_string();
+        // The handshake recorded the address the connection had before a NAT
+        // rebinding moved it to its current one.
+        let handshake_addr: SocketAddr = "203.0.113.7:22804".parse().unwrap();
+        let current_addr = server_conn.remote_address();
+
+        let mut vc = ValidatorConnection::new(hotkey.clone(), "conn_1".into(), server_conn.clone());
+        vc.verify();
+        ctx.connections.write().await.insert(hotkey.clone(), vc);
+        ctx.addr_to_hotkey
+            .write()
+            .await
+            .insert(handshake_addr, hotkey.clone());
+
+        let authed = dispatch::verify_synapse_auth(&server_conn, &ctx).await;
+        assert_eq!(authed.ok(), Some(hotkey.clone()));
+        {
+            let index = ctx.addr_to_hotkey.read().await;
+            assert_eq!(index.get(&current_addr), Some(&hotkey));
+            assert!(!index.contains_key(&handshake_addr));
+        }
+
+        // Subsequent requests take the address fast path.
+        let again = dispatch::verify_synapse_auth(&server_conn, &ctx).await;
+        assert_eq!(again.ok(), Some(hotkey));
+
+        client_conn.close(0u32.into(), b"done");
+    }
+
+    #[tokio::test]
+    async fn verify_synapse_auth_rejects_other_connection_on_stale_address() {
+        let (_se_a, _ce_a, client_a, validator_conn) = quic_pair().await;
+        let (_se_b, _ce_b, client_b, intruder_conn) = quic_pair().await;
+        let ctx = test_server_context(LightningServerConfig::default());
+        let hotkey = "test_validator".to_string();
+
+        let mut vc = ValidatorConnection::new(hotkey.clone(), "conn_1".into(), validator_conn.clone());
+        vc.verify();
+        ctx.connections.write().await.insert(hotkey.clone(), vc);
+        // The validator's old address has since been handed to another peer
+        // (a recycled port on a shared NAT) that never completed a handshake.
+        ctx.addr_to_hotkey
+            .write()
+            .await
+            .insert(intruder_conn.remote_address(), hotkey.clone());
+
+        let intruder = dispatch::verify_synapse_auth(&intruder_conn, &ctx).await;
+        assert!(intruder.is_err());
+
+        // The validator's own connection still authenticates and reclaims the index.
+        let validator = dispatch::verify_synapse_auth(&validator_conn, &ctx).await;
+        assert_eq!(validator.ok(), Some(hotkey.clone()));
+        {
+            let index = ctx.addr_to_hotkey.read().await;
+            assert_eq!(index.get(&validator_conn.remote_address()), Some(&hotkey));
+            assert!(!index.contains_key(&intruder_conn.remote_address()));
+        }
+        assert!(dispatch::verify_synapse_auth(&intruder_conn, &ctx)
+            .await
+            .is_err());
+
+        client_a.close(0u32.into(), b"done");
+        client_b.close(0u32.into(), b"done");
+    }
+
+    #[tokio::test]
+    async fn handshake_on_migrated_connection_drops_stale_addresses() {
+        let (_server_endpoint, _client_endpoint, client_conn, server_conn) = quic_pair().await;
+        let fp = [7u8; 32];
+        let mut ctx = test_server_context(LightningServerConfig::default());
+        ctx.miner_signer = Some(Arc::new(crate::signing::Sr25519Signer::from_seed(
+            [9u8; 32],
+        )));
+        *ctx.cert_fingerprint.write().await = Some(fp);
+
+        let request = make_signed_request("00000000000000000000000000000abc", &fp);
+        let hotkey = request.validator_hotkey.clone();
+        // The validator already authenticated this connection from an address
+        // it has since migrated away from, and now re-handshakes on it.
+        let handshake_addr: SocketAddr = "203.0.113.7:22804".parse().unwrap();
+        let mut vc = ValidatorConnection::new(hotkey.clone(), "conn_0".into(), server_conn.clone());
+        vc.verify();
+        ctx.connections.write().await.insert(hotkey.clone(), vc);
+        ctx.addr_to_hotkey
+            .write()
+            .await
+            .insert(handshake_addr, hotkey.clone());
+
+        let response = handshake::process_handshake(request, server_conn.clone(), &ctx).await;
+        assert!(response.accepted);
+        let index = ctx.addr_to_hotkey.read().await;
+        assert_eq!(index.len(), 1);
+        assert_eq!(index.get(&server_conn.remote_address()), Some(&hotkey));
+
+        client_conn.close(0u32.into(), b"done");
+    }
+
+    #[tokio::test]
+    async fn verify_synapse_auth_rejects_unverified_and_unknown_connections() {
+        let (_se_a, _ce_a, client_a, unverified_conn) = quic_pair().await;
+        let (_se_b, _ce_b, client_b, unknown_conn) = quic_pair().await;
+        let ctx = test_server_context(LightningServerConfig::default());
+        let hotkey = "test_validator".to_string();
+
+        let vc = ValidatorConnection::new(hotkey.clone(), "conn_1".into(), unverified_conn.clone());
+        ctx.connections.write().await.insert(hotkey.clone(), vc);
+        ctx.addr_to_hotkey
+            .write()
+            .await
+            .insert(unverified_conn.remote_address(), hotkey);
+
+        assert!(dispatch::verify_synapse_auth(&unverified_conn, &ctx)
+            .await
+            .is_err());
+        assert!(dispatch::verify_synapse_auth(&unknown_conn, &ctx)
+            .await
+            .is_err());
+
+        client_a.close(0u32.into(), b"done");
+        client_b.close(0u32.into(), b"done");
     }
 
     fn test_server_context(config: LightningServerConfig) -> ServerContext {

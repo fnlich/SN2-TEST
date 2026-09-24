@@ -35,3 +35,5 @@ ctor = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+rmpv = { workspace = true }
+sp-core = { workspace = true }

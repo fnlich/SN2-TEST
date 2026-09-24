@@ -118,12 +118,12 @@ pub(super) async fn process_handshake(
                 "closing previous connection for validator (replaced by new handshake)"
             );
             prev_conn.connection.close(0u32.into(), b"replaced");
-            let prev_addr = prev_conn.connection.remote_address();
-            if prev_addr != remote_addr {
-                addr_index.remove(&prev_addr);
-            }
         }
     }
+    // The validator now has exactly one authenticated connection, so drop every
+    // other address the index holds for it: the replaced connection's current
+    // address, and any address it held before a migration it never re-keyed.
+    addr_index.retain(|addr, hk| *hk != request.validator_hotkey || *addr == remote_addr);
     addr_index.insert(remote_addr, request.validator_hotkey.clone());
     drop(addr_index);
     drop(connections_guard);
