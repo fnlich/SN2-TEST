@@ -8,7 +8,7 @@ use crate::util::unix_timestamp_secs;
 use quinn::{Connection, RecvStream, SendStream};
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 
 pub(super) async fn handle_connection(connection: Connection, ctx: ServerContext) {
     let connection = Arc::new(connection);
@@ -23,9 +23,12 @@ pub(super) async fn handle_connection(connection: Connection, ctx: ServerContext
                 let conn = connection.clone();
                 let ctx = ctx.clone();
 
-                tokio::spawn(async move {
-                    handle_stream(send, recv, conn, ctx).await;
-                });
+                tokio::spawn(
+                    async move {
+                        handle_stream(send, recv, conn, ctx).await;
+                    }
+                    .in_current_span(),
+                );
             }
             Err(e) => {
                 let close_reason = connection.close_reason();

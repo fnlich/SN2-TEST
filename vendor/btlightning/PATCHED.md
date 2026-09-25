@@ -36,6 +36,9 @@ shared NAT) would have been treated as the validator without a handshake.
 - `src/server/mod.rs` `remove_hotkey_from_maps`: removes all of the validator's
   addresses, so a migrated connection does not leave its handshake-time address
   behind.
+- `src/server/mod.rs` accept loop and `src/server/dispatch.rs` per-stream tasks
+  run in the caller's tracing span (`in_current_span`), so when one process
+  serves several miners, connection and handshake logs carry the miner's span.
 - Unit tests for the above in `src/server/mod.rs`. The end-to-end NAT rebinding
   test lives in `crates/sn2-miner/tests/quic_nat_rebind.rs`.
 

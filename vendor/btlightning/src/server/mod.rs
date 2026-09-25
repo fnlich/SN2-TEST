@@ -23,7 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
-use tracing::{error, info, instrument, warn};
+use tracing::{error, info, instrument, warn, Instrument};
 
 /// Resolves the set of validator hotkeys allowed to connect.
 ///
@@ -711,7 +711,8 @@ impl LightningServer {
                         error!("Connection accept failed: {}", e);
                     }
                 }
-            });
+            }
+            .in_current_span());
         }
         Ok(())
     }
