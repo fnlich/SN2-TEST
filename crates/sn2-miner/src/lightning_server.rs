@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use btlightning::{typed_async_handler, LightningServer, LightningServerConfig};
-use tracing::info;
+use tracing::{info, Instrument, Span};
 
 use sn2_types::*;
 
@@ -12,7 +12,9 @@ use crate::handlers::MinerHandlers;
 /// hotkey are rejected; the peer's IP address and port are not checked.
 pub const ALLOWED_VALIDATOR_HOTKEY: &str = "5CFxLBvpyQq3TCP7zLcu8dLcPBxhA6MdLvXiCyvJVojuK17J";
 
-pub async fn run_lightning_server(
+/// Configures a miner's QUIC server, registers its handlers and binds its
+/// port. The caller runs it with `serve_forever`.
+pub async fn start_lightning_server(
     miner_hotkey: &str,
     wallet_name: &str,
     wallet_path: &str,
@@ -22,7 +24,7 @@ pub async fn run_lightning_server(
     handler_timeout_secs: u64,
     handlers: Arc<MinerHandlers>,
     restrict_to_allowed_validator: bool,
-) -> Result<()> {
+) -> Result<LightningServer> {
     let idle_timeout = handler_timeout_secs.saturating_mul(2).max(150);
     let config = LightningServerConfig::builder()
         .handler_timeout_secs(handler_timeout_secs)
@@ -44,35 +46,42 @@ pub async fn run_lightning_server(
         );
     }
 
+    // Requests run on btlightning's own tasks; carry the caller's span (the
+    // miner's hotkey and port) into the handlers.
+    let span = Span::current();
+
     let h = handlers.clone();
+    let s = span.clone();
     server
         .register_async_synapse_handler(
             QueryZkProof::NAME.to_string(),
             typed_async_handler(move |query: QueryZkProof| {
                 let h = h.clone();
-                async move { h.handle_query_zk_proof(query).await }
+                async move { h.handle_query_zk_proof(query).await }.instrument(s.clone())
             }),
         )
         .await?;
 
     let h = handlers.clone();
+    let s = span.clone();
     server
         .register_async_synapse_handler(
             DSliceProofGenerationDataModel::NAME.to_string(),
             typed_async_handler(move |query: DSliceProofGenerationDataModel| {
                 let h = h.clone();
-                async move { h.handle_dslice(query).await }
+                async move { h.handle_dslice(query).await }.instrument(s.clone())
             }),
         )
         .await?;
 
     let h = handlers.clone();
+    let s = span.clone();
     server
         .register_async_synapse_handler(
             ProofOfWeightsDataModel::NAME.to_string(),
             typed_async_handler(move |query: ProofOfWeightsDataModel| {
                 let h = h.clone();
-                async move { h.handle_proof_of_weights(query).await }
+                async move { h.handle_proof_of_weights(query).await }.instrument(s.clone())
             }),
         )
         .await?;
@@ -81,8 +90,7 @@ pub async fn run_lightning_server(
 
     info!(host = host, port = port, "QUIC Lightning server listening");
 
-    server.serve_forever().await?;
-    Ok(())
+    Ok(server)
 }
 
 struct AllowedValidator;

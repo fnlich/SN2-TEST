@@ -30,14 +30,18 @@ mod handlers;
 mod lightning_server;
 mod wai_known_constants;
 
+use std::collections::HashSet;
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches};
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tokio::task::JoinSet;
+use tracing::{info, info_span, warn, Instrument};
 
 use crate::cli::Cli;
 
@@ -47,9 +51,20 @@ async fn main() -> Result<()> {
         .install_default()
         .expect("failed to install rustls CryptoProvider");
 
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
 
     sn2_types::init_tracing(&cli.log_level);
+
+    if !cli.miners.is_empty()
+        && matches.value_source("wallet_hotkey") == Some(ValueSource::CommandLine)
+        && !cli.miners.iter().any(|m| m.hotkey == cli.wallet_hotkey)
+    {
+        warn!(
+            wallet_hotkey = %cli.wallet_hotkey,
+            "--wallet-hotkey is ignored because --miner is set; add it as a --miner entry to keep serving it"
+        );
+    }
 
     info!(version = sn2_types::SOFTWARE_VERSION, "sn2-miner");
 
@@ -57,7 +72,7 @@ async fn main() -> Result<()> {
         return run_loopback(cli).await;
     }
 
-    let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     if !cli.no_auto_update && option_env!("SN2_RELEASE_CHANNEL") == Some("mainnet") {
         let _update_handle =
@@ -70,14 +85,7 @@ async fn main() -> Result<()> {
         "starting sn2-miner"
     );
 
-    let wallet = std::sync::Arc::new(
-        sn2_chain::Wallet::from_paths(
-            &cli.wallet_name,
-            &cli.wallet_hotkey,
-            cli.wallet_path.as_deref(),
-        )
-        .context("loading wallet")?,
-    );
+    let miners = load_miners(&cli)?;
 
     let endpoint =
         sn2_chain::resolve_endpoint(&cli.network, cli.subtensor_chain_endpoint.as_deref());
@@ -92,13 +100,26 @@ async fn main() -> Result<()> {
         .await
         .context("initial metagraph sync")?;
 
+    // A deregistered hotkey must not take the other miners down with it.
+    let (miners, unregistered): (Vec<Miner>, Vec<Miner>) = miners.into_iter().partition(|m| {
+        metagraph
+            .get_uid_by_hotkey(m.wallet.hotkey_ss58())
+            .is_some()
+    });
+    for miner in &unregistered {
+        warn!(
+            hotkey = %miner.wallet.hotkey_ss58(),
+            port = miner.port,
+            "hotkey is not registered on subnet {}; not serving it. Register with: btcli subnets register --netuid {} --network {}",
+            cli.netuid,
+            cli.netuid,
+            cli.network,
+        );
+    }
     anyhow::ensure!(
-        metagraph.get_uid_by_hotkey(wallet.hotkey_ss58()).is_some(),
-        "hotkey {} is not registered on subnet {}. Register with: btcli subnets register --netuid {} --network {}",
-        wallet.hotkey_ss58(),
-        cli.netuid,
-        cli.netuid,
-        cli.network,
+        !miners.is_empty(),
+        "none of the configured hotkeys is registered on subnet {}",
+        cli.netuid
     );
 
     let external_ip = match resolve_external_ip(cli.external_ip.as_deref()).await {
@@ -113,145 +134,199 @@ async fn main() -> Result<()> {
         Err(e) => return Err(e),
     };
 
-    let quic_port = cli.axon_port;
-    anyhow::ensure!(quic_port != 0, "QUIC port must be non-zero");
+    let handlers = init_handlers(&cli, false).await;
+    let servers = start_servers(&miners, "0.0.0.0", cli.handler_timeout, handlers, true).await?;
 
-    let dsperse = dsperse::DSperseClient::new(cli.circuit_cache_dir.as_deref());
+    for miner in &miners {
+        info!(
+            hotkey = %miner.wallet.hotkey_ss58(),
+            quic_port = miner.port,
+            "miner running"
+        );
+    }
 
-    let circuit_store = init_circuit_store(
-        false,
-        &cli.additional_circuits,
-        cli.circuit_cache_dir.as_deref(),
-    )
-    .await;
-
-    let handlers = handlers::MinerHandlers::new(dsperse, circuit_store);
-    let handlers = std::sync::Arc::new(handlers);
-
-    let handler_timeout = cli.handler_timeout;
-    let quic_handle = {
-        let handlers = handlers.clone();
-        let hotkey = wallet.hotkey_ss58().to_string();
-        let w_name = wallet.name.clone();
-        let w_path = wallet.wallet_path.clone();
-        let w_hotkey = wallet.hotkey_name.clone();
-        tokio::spawn(async move {
-            lightning_server::run_lightning_server(
-                &hotkey,
-                &w_name,
-                &w_path,
-                &w_hotkey,
-                "0.0.0.0",
-                quic_port,
-                handler_timeout,
-                handlers,
-                true,
-            )
-            .await
-        })
-    };
-
+    // Registering an axon waits for block finalization. Each hotkey signs its
+    // own extrinsic and has its own serving rate limit, so register them
+    // concurrently, off the path that watches the servers and signals.
     if let Some(external_ip) = external_ip {
-        match registration
-            .serve_axon(&chain_client, &wallet, external_ip, quic_port, 4)
-            .await
-        {
-            Ok(()) => {}
-            Err(e) => {
-                warn!(error = %e, "serve_axon failed (rate-limited or transient); miner will continue");
-            }
+        let registration = Arc::new(registration);
+        for miner in &miners {
+            let registration = registration.clone();
+            let chain_client = chain_client.clone();
+            let wallet = miner.wallet.clone();
+            let port = miner.port;
+            tokio::spawn(async move {
+                let served = tokio::time::timeout(
+                    SERVE_AXON_TIMEOUT,
+                    registration.serve_axon(&chain_client, &wallet, external_ip, port, 4),
+                )
+                .await;
+                let error = match served {
+                    Ok(Ok(())) => return,
+                    Ok(Err(e)) => e.to_string(),
+                    Err(_) => format!("timed out after {}s", SERVE_AXON_TIMEOUT.as_secs()),
+                };
+                warn!(
+                    hotkey = %wallet.hotkey_ss58(),
+                    port,
+                    error,
+                    "serve_axon failed (rate-limited or transient); miner will continue"
+                );
+            });
         }
     }
 
-    info!(
-        hotkey = %wallet.hotkey_ss58(),
-        quic_port = quic_port,
-        "miner running"
-    );
-
-    let mut sigterm = signal(SignalKind::terminate()).context("registering SIGTERM handler")?;
-
-    tokio::select! {
-        r = quic_handle => {
-            r?.context("QUIC server")?;
-        }
-        _ = tokio::signal::ctrl_c() => {
-            info!("shutting down miner");
-        }
-        _ = sigterm.recv() => {
-            info!("received SIGTERM, shutting down miner");
-        }
-        _ = async { loop { shutdown_rx.changed().await.ok()?; if *shutdown_rx.borrow() { return Some(()); } } } => {
-            info!("shutting down miner for auto-update restart");
-        }
-    }
-
-    Ok(())
+    run_until_shutdown(servers, Some(shutdown_rx)).await
 }
 
 async fn run_loopback(cli: Cli) -> Result<()> {
-    info!(
-        port = cli.axon_port,
-        "starting miner in loopback mode (no chain interaction)"
-    );
+    info!("starting miner in loopback mode (no chain interaction)");
 
-    let wallet = sn2_chain::Wallet::from_paths(
-        &cli.wallet_name,
-        &cli.wallet_hotkey,
-        cli.wallet_path.as_deref(),
+    let miners = load_miners(&cli)?;
+    let handlers = init_handlers(&cli, true).await;
+    let servers = start_servers(
+        &miners,
+        &cli.axon_host,
+        cli.handler_timeout,
+        handlers,
+        false,
     )
-    .context("loading wallet")?;
+    .await?;
 
+    for miner in &miners {
+        info!(
+            hotkey = %miner.wallet.hotkey_ss58(),
+            port = miner.port,
+            "miner loopback running"
+        );
+    }
+
+    run_until_shutdown(servers, None).await
+}
+
+const SERVE_AXON_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// One miner identity served by this process. Every miner shares the process's
+/// circuit store, prover and caches; only the hotkey and QUIC port differ.
+struct Miner {
+    wallet: Arc<sn2_chain::Wallet>,
+    port: u16,
+}
+
+fn load_miners(cli: &Cli) -> Result<Vec<Miner>> {
+    let mut miners = Vec::new();
+    let mut hotkeys = HashSet::new();
+    for spec in cli.miner_specs()? {
+        let wallet_name = spec.wallet_name.as_deref().unwrap_or(&cli.wallet_name);
+        let wallet =
+            sn2_chain::Wallet::from_paths(wallet_name, &spec.hotkey, cli.wallet_path.as_deref())
+                .with_context(|| format!("loading wallet {wallet_name}/{}", spec.hotkey))?;
+        anyhow::ensure!(
+            hotkeys.insert(wallet.hotkey_ss58().to_string()),
+            "hotkey {} is assigned to more than one miner",
+            wallet.hotkey_ss58()
+        );
+        miners.push(Miner {
+            wallet: Arc::new(wallet),
+            port: spec.port,
+        });
+    }
+    Ok(miners)
+}
+
+async fn init_handlers(cli: &Cli, loopback: bool) -> Arc<handlers::MinerHandlers> {
     let dsperse = dsperse::DSperseClient::new(cli.circuit_cache_dir.as_deref());
-
     let circuit_store = init_circuit_store(
-        true,
+        loopback,
         &cli.additional_circuits,
         cli.circuit_cache_dir.as_deref(),
     )
     .await;
+    Arc::new(handlers::MinerHandlers::new(dsperse, circuit_store))
+}
 
-    let handlers = handlers::MinerHandlers::new(dsperse, circuit_store);
-    let handlers = std::sync::Arc::new(handlers);
-
-    let handler_timeout = cli.handler_timeout;
-    let quic_handle = {
-        let handlers = handlers.clone();
-        let host = cli.axon_host.clone();
-        let port = cli.axon_port;
-        let hotkey_ss58 = wallet.hotkey_ss58().to_string();
-        let w_name = wallet.name.clone();
-        let w_path = wallet.wallet_path.clone();
-        let w_hotkey = wallet.hotkey_name.clone();
-        tokio::spawn(async move {
-            lightning_server::run_lightning_server(
-                &hotkey_ss58,
-                &w_name,
-                &w_path,
-                &w_hotkey,
-                &host,
-                port,
-                handler_timeout,
-                handlers,
-                false,
+/// Binds every miner's QUIC server, then serves them all. Binding first means a
+/// port conflict fails startup before anything is registered on chain.
+async fn start_servers(
+    miners: &[Miner],
+    host: &str,
+    handler_timeout: u64,
+    handlers: Arc<handlers::MinerHandlers>,
+    restrict_to_allowed_validator: bool,
+) -> Result<JoinSet<Result<()>>> {
+    let mut bound = Vec::with_capacity(miners.len());
+    for miner in miners {
+        let wallet = &miner.wallet;
+        let span = info_span!("miner", hotkey = %wallet.hotkey_ss58(), port = miner.port);
+        let server = lightning_server::start_lightning_server(
+            wallet.hotkey_ss58(),
+            &wallet.name,
+            &wallet.wallet_path,
+            &wallet.hotkey_name,
+            host,
+            miner.port,
+            handler_timeout,
+            handlers.clone(),
+            restrict_to_allowed_validator,
+        )
+        .instrument(span.clone())
+        .await
+        .with_context(|| {
+            format!(
+                "starting QUIC server for {} on port {}",
+                wallet.hotkey_ss58(),
+                miner.port
             )
-            .await
-        })
+        })?;
+        bound.push((server, span, wallet.hotkey_ss58().to_string(), miner.port));
+    }
+
+    let mut servers = JoinSet::new();
+    for (server, span, hotkey, port) in bound {
+        servers.spawn(
+            async move {
+                server
+                    .serve_forever()
+                    .await
+                    .with_context(|| format!("QUIC server for {hotkey} on port {port}"))
+            }
+            .instrument(span),
+        );
+    }
+    Ok(servers)
+}
+
+/// Runs until any miner's server stops, a signal arrives, or the auto-updater
+/// asks for a restart. Remaining servers are aborted when `servers` drops.
+async fn run_until_shutdown(
+    mut servers: JoinSet<Result<()>>,
+    update_rx: Option<watch::Receiver<bool>>,
+) -> Result<()> {
+    let mut sigterm = signal(SignalKind::terminate()).context("registering SIGTERM handler")?;
+    let update_requested = async {
+        let Some(mut rx) = update_rx else {
+            return std::future::pending().await;
+        };
+        loop {
+            rx.changed().await.ok()?;
+            if *rx.borrow() {
+                return Some(());
+            }
+        }
     };
 
-    info!(port = cli.axon_port, "miner loopback running");
-
-    let mut sigterm = signal(SignalKind::terminate()).context("registering SIGTERM handler")?;
-
     tokio::select! {
-        r = quic_handle => {
-            r?.context("QUIC server")?;
+        Some(r) = servers.join_next() => {
+            r.context("QUIC server task panicked")??;
         }
         _ = tokio::signal::ctrl_c() => {
             info!("shutting down miner");
         }
         _ = sigterm.recv() => {
             info!("received SIGTERM, shutting down miner");
+        }
+        _ = update_requested => {
+            info!("shutting down miner for auto-update restart");
         }
     }
 

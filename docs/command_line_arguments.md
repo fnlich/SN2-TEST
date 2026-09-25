@@ -19,11 +19,33 @@ All arguments use `--long-flag` syntax. Flags are shared between miner and valid
 
 | Argument | Default | Description |
 |----------|---------|-------------|
-| `--axon-host` | `0.0.0.0` | Bind address for the HTTP axon server |
-| `--axon-port` | `8091` | HTTP axon port |
-| `--quic-port` | `8092` | QUIC ([btlightning](https://github.com/inference-labs-inc/lightning)) server port |
+| `--axon-host` | `0.0.0.0` | Bind address for the QUIC server in `--loopback` mode |
+| `--axon-port` | `8091` | QUIC ([btlightning](https://github.com/inference-labs-inc/lightning)) server port (UDP), registered on-chain as the axon port |
 | `--external-ip` | None | Public IP to register on-chain for the axon |
-| `--dsperse-socket` | None | dsperse prover socket address |
+| `--miner` | None | Serve several miners from one process: `[WALLET/]HOTKEY:PORT`, repeatable or comma-separated. Cannot be combined with `--axon-port`; `--wallet-hotkey` is ignored (with a warning) |
+| `--circuit-cache-dir` | `~/.bittensor/subnet-2/circuit_cache` | Circuit cache directory (also `SN2_CIRCUIT_CACHE_DIR`) |
+| `--additional-circuits` | None | Circuit IDs to preload at startup |
+| `--handler-timeout` | `180` | Per-request handler timeout in seconds |
+| `--loopback` | `false` | Run without chain interaction, for local testing |
+
+### Running several miners in one process
+
+Each `--miner` entry is a separate miner with its own hotkey and QUIC port. All of them share one circuit cache, one prover and its caches, and one chain connection, so adding a miner does not download circuits or load prover state again, and the miners do not compete with each other's prover thread pools as separate processes would. `WALLET` defaults to `--wallet-name`.
+
+```console
+pm2 start target/release/sn2-miner --name subnet-2-miner --kill-timeout 3000 -- \
+  --wallet-name miner \
+  --miner hk1:8091,hk2:8092,hk3:8093 \
+  --netuid 2
+```
+
+- Every hotkey needs its own registration. Hotkeys that are not registered when the miner starts are skipped with a warning; restart the miner after registering one. Startup fails only if none is registered.
+- Each miner's axon is registered at `--external-ip` (or the detected public IP) with that miner's port.
+- Open every port for UDP, for example `sudo ufw allow 8091:8093/udp` plus matching UDP rules in the cloud security group. With Docker, publish each port as UDP with the same host and container port, for example `-p 8091-8093:8091-8093/udp`.
+- `make pm2-miner ARGS="--miner ..."` always passes `--wallet-hotkey`, so the "--wallet-hotkey is ignored" warning is expected there.
+- The miners share one process, so a restart disconnects all of them at once. Restart rarely and batch hotkey changes.
+
+**When extra miners help.** Validators dispatch work per UID, so more hotkeys bring more work only while the validator's per-miner dispatch, not this machine's CPU, is the limit. Scores grow faster than linearly with each UID's delivered work, so splitting a machine that is already busy across more hotkeys lowers total reward. A new hotkey also earns nothing during its first hours (verification coldstart and the minimum sample count). Add miners only while the machine has steady idle capacity, and compare total delivered work before and after.
 
 ## Validator Arguments
 
