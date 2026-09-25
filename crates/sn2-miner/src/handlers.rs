@@ -1,3 +1,7 @@
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
 use anyhow::Result;
 use serde_json::json;
 use sn2_circuit_store::CircuitStore;
@@ -8,9 +12,17 @@ use sn2_types::*;
 
 use crate::dsperse::{normalize_slice_id, DSperseClient};
 
+/// How long a failed circuit fetch is remembered before it is retried.
+const CIRCUIT_FETCH_RETRY_AFTER: Duration = Duration::from_secs(30);
+
 pub struct MinerHandlers {
     dsperse: DSperseClient,
     circuit_store: RwLock<CircuitStore>,
+    /// Circuits whose fetch failed recently. A fetch holds the store's write
+    /// lock, which every request (from every miner this process serves) needs
+    /// to read, so retrying a failing fetch on each request would stall them
+    /// all for the fetch timeout each time.
+    failed_fetches: Mutex<HashMap<String, Instant>>,
 }
 
 impl MinerHandlers {
@@ -18,6 +30,7 @@ impl MinerHandlers {
         Self {
             dsperse,
             circuit_store: RwLock::new(circuit_store),
+            failed_fetches: Mutex::new(HashMap::new()),
         }
     }
 
@@ -28,11 +41,47 @@ impl MinerHandlers {
                 return Ok(());
             }
         }
+        self.check_fetch_backoff(circuit_id)?;
         let mut store = self.circuit_store.write().await;
         if store.get_circuit(circuit_id).is_some() {
             return Ok(());
         }
-        store.ensure_circuit(circuit_id).await?;
+        // A request that queued behind a fetch that just failed should not
+        // repeat it.
+        self.check_fetch_backoff(circuit_id)?;
+        let result = store.ensure_circuit(circuit_id).await;
+        let mut failed = self
+            .failed_fetches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match result {
+            Ok(_) => {
+                failed.remove(circuit_id);
+                Ok(())
+            }
+            Err(e) => {
+                let now = Instant::now();
+                failed.retain(|_, at| now.duration_since(*at) < CIRCUIT_FETCH_RETRY_AFTER);
+                failed.insert(circuit_id.to_string(), now);
+                Err(e)
+            }
+        }
+    }
+
+    fn check_fetch_backoff(&self, circuit_id: &str) -> Result<()> {
+        let failed = self
+            .failed_fetches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(at) = failed.get(circuit_id) {
+            let elapsed = at.elapsed();
+            anyhow::ensure!(
+                elapsed >= CIRCUIT_FETCH_RETRY_AFTER,
+                "circuit {circuit_id} fetch failed {}s ago; retrying after {}s",
+                elapsed.as_secs(),
+                CIRCUIT_FETCH_RETRY_AFTER.as_secs()
+            );
+        }
         Ok(())
     }
 

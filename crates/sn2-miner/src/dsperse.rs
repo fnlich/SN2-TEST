@@ -16,7 +16,13 @@ pub struct DSperseClient {
     /// request means a fresh cache-miss every time, even for a circuit
     /// that was just proved a moment ago. Mirrors the pattern already
     /// used by `sn2-verify`'s validator-side `BACKEND` static.
-    backend: Arc<dsperse::backend::jstprove::JstproveBackend>,
+    ///
+    /// Sharded by bundle path: `load_bundle_cached` holds the backend's
+    /// cache mutex while it reads and decompresses a cold bundle, so a
+    /// single backend makes every concurrent request -- across all miners
+    /// this process serves -- wait behind any cold load. Each bundle maps
+    /// to exactly one shard, so nothing is cached twice.
+    backends: Vec<Arc<dsperse::backend::jstprove::JstproveBackend>>,
     /// Caches `resolve_component`'s (component_sha, slice_id) -> slice_dir
     /// lookups, avoiding a full scan of every locally cached model
     /// directory on repeat DSlice requests for the same component.
@@ -288,7 +294,18 @@ fn prove_and_build_response(
     })
 }
 
+/// Number of independent prover backends (and bundle-cache locks).
+const BACKEND_SHARDS: usize = 16;
+
 impl DSperseClient {
+    /// The backend that owns `circuit_path`'s cached bundle.
+    fn backend_for(&self, circuit_path: &Path) -> Arc<dsperse::backend::jstprove::JstproveBackend> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        circuit_path.hash(&mut hasher);
+        Arc::clone(&self.backends[hasher.finish() as usize % self.backends.len()])
+    }
+
     pub fn new(cache_dir_override: Option<&str>) -> Self {
         let cache_dir = PathBuf::from(
             shellexpand::tilde(cache_dir_override.unwrap_or(sn2_types::CIRCUIT_CACHE_DIR))
@@ -296,17 +313,19 @@ impl DSperseClient {
         );
         info!(cache_dir = %cache_dir.display(), "initialized DSperseClient");
 
-        let backend = Arc::new(dsperse::backend::jstprove::JstproveBackend::new());
+        let backends: Vec<_> = (0..BACKEND_SHARDS)
+            .map(|_| Arc::new(dsperse::backend::jstprove::JstproveBackend::new()))
+            .collect();
         {
-            let backend = Arc::clone(&backend);
+            let backends = backends.clone();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(
                     sn2_types::BUNDLE_CACHE_IDLE_TTL_SECS,
                 ));
                 loop {
                     interval.tick().await;
-                    let evicted = backend
-                        .evict_idle(Duration::from_secs(sn2_types::BUNDLE_CACHE_IDLE_TTL_SECS));
+                    let ttl = Duration::from_secs(sn2_types::BUNDLE_CACHE_IDLE_TTL_SECS);
+                    let evicted: usize = backends.iter().map(|b| b.evict_idle(ttl)).sum();
                     if evicted > 0 {
                         info!(evicted, "evicted idle compiled circuit bundles");
                     }
@@ -316,7 +335,7 @@ impl DSperseClient {
 
         Self {
             cache_dir,
-            backend,
+            backends,
             component_cache: RwLock::new(HashMap::new()),
             onnx_cache: RwLock::new(HashMap::new()),
             onnx_initializers_cache: Arc::new(RwLock::new(HashMap::new())),
@@ -388,8 +407,10 @@ impl DSperseClient {
         // available for free here -- priming onnx_cache with it saves
         // prove_slice's later resolve_slice_onnx call from re-listing the
         // exact same payload/ directory it was just computed from.
+        let span = tracing::Span::current();
         let resolved: Option<(PathBuf, PathBuf)> =
             tokio::task::spawn_blocking(move || -> Result<Option<(PathBuf, PathBuf)>> {
+                let _span = span.enter();
                 let entries = match std::fs::read_dir(&cache_dir) {
                     Ok(e) => e,
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -466,9 +487,11 @@ impl DSperseClient {
         );
 
         let inputs_clone = inputs.clone();
-        let backend = Arc::clone(&self.backend);
+        let backend = self.backend_for(&circuit_path);
+        let span = tracing::Span::current();
 
         tokio::task::spawn_blocking(move || -> Result<ProveArtifacts> {
+            let _span = span.enter();
             let inputs_bytes = rmp_serde::to_vec_named(&inputs_clone)?;
 
             let params = backend
@@ -536,11 +559,13 @@ impl DSperseClient {
         );
 
         let input_data = extract_input_json(inputs).clone();
-        let backend = Arc::clone(&self.backend);
+        let backend = self.backend_for(&circuit_path);
         let onnx_initializers_cache = Arc::clone(&self.onnx_initializers_cache);
         let whole_model_initializers_cache = Arc::clone(&self.whole_model_initializers_cache);
+        let span = tracing::Span::current();
 
         tokio::task::spawn_blocking(move || -> Result<ProveArtifacts> {
+            let _span = span.enter();
             let input_flat = flatten_json_to_f64(&input_data);
             anyhow::ensure!(
                 !input_flat.is_empty(),
