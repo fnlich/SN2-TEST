@@ -11,8 +11,8 @@ use crate::subxt_helpers::{at_current_block, fetch_typed, fetch_u128_or, netuid_
 use crate::wallet::Wallet;
 
 const BLOCK_TIME: f64 = 12.0;
-const TX_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
-const TX_FINALIZATION_TIMEOUT: Duration = Duration::from_secs(180);
+pub(crate) const TX_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const TX_FINALIZATION_TIMEOUT: Duration = Duration::from_secs(180);
 const COMMIT_REVEAL_VERSION: u64 = 4;
 
 #[derive(Clone)]

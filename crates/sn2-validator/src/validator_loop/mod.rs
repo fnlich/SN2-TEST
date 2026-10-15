@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use sn2_chain::{Registration, WeightsSetter};
+use sn2_chain::{Registration, ServeAxonOutcome, WeightsSetter};
 use sn2_types::*;
 use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::{watch, Notify, RwLock};
@@ -567,12 +567,23 @@ impl ValidatorLoop {
             }
         };
         let registration = Registration::new(self.config.netuid);
-        if let Err(e) = registration
+        match registration
             .serve_axon(chain_client, wallet, external_ip, self.config.axon_port, 4)
             .await
         {
-            warn!(error = ?e, ip = %external_ip, port = self.config.axon_port,
-                "axon publish to chain failed; will retry on next metagraph sync");
+            Ok(ServeAxonOutcome::AlreadyServed | ServeAxonOutcome::Served { .. }) => {}
+            Ok(ServeAxonOutcome::NotRegistered) => {
+                warn!(ip = %external_ip, port = self.config.axon_port,
+                    "validator hotkey has no uid on this subnet; axon not published");
+            }
+            Ok(ServeAxonOutcome::RateLimited { blocks }) => {
+                info!(ip = %external_ip, port = self.config.axon_port, blocks,
+                    "serving rate limit blocks the axon publish; will retry on next metagraph sync");
+            }
+            Err(e) => {
+                warn!(error = ?e, ip = %external_ip, port = self.config.axon_port,
+                    "axon publish to chain failed; will retry on next metagraph sync");
+            }
         }
     }
 
