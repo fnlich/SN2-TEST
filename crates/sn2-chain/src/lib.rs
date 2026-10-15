@@ -14,7 +14,7 @@ use subxt::rpcs::RpcClient;
 use subxt::{OnlineClient, PolkadotConfig};
 
 pub use metagraph::{Metagraph, NeuronInfo};
-pub use registration::Registration;
+pub use registration::{ChainAxon, Registration, ServeAxonOutcome};
 pub use wallet::Wallet;
 pub use weights::WeightsSetter;
 

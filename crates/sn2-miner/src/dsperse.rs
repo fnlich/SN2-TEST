@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use sn2_types::json_tensor::flatten_json_to_f64;
@@ -55,6 +55,14 @@ pub struct DSperseClient {
     /// for why a failed parse is deliberately evicted rather than left
     /// permanently cached in the `OnceLock`.
     whole_model_initializers_cache: Arc<RwLock<HashMap<PathBuf, Arc<WholeModelOnceCell>>>>,
+    /// One permit per proof allowed to run at once, shared by every miner this
+    /// process serves. A proof runs on one core from start to finish, so more
+    /// proofs than cores only time-slice them: every in-flight request slows
+    /// down together, and each holds its working set in RAM meanwhile. Excess
+    /// requests wait in arrival order instead. The permit moves into the
+    /// blocking task, so a proof whose request already timed out (a blocking
+    /// task cannot be cancelled) keeps its slot until it actually finishes.
+    proof_slots: Arc<tokio::sync::Semaphore>,
 }
 
 /// `OnceLock` value for `whole_model_initializers_cache` -- `None` means a
@@ -297,6 +305,9 @@ fn prove_and_build_response(
 /// Number of independent prover backends (and bundle-cache locks).
 const BACKEND_SHARDS: usize = 16;
 
+/// Waits for a proof slot at least this long are logged.
+const PROOF_SLOT_WAIT_LOG_THRESHOLD: Duration = Duration::from_secs(1);
+
 impl DSperseClient {
     /// The backend that owns `circuit_path`'s cached bundle.
     fn backend_for(&self, circuit_path: &Path) -> Arc<dsperse::backend::jstprove::JstproveBackend> {
@@ -306,12 +317,18 @@ impl DSperseClient {
         Arc::clone(&self.backends[hasher.finish() as usize % self.backends.len()])
     }
 
-    pub fn new(cache_dir_override: Option<&str>) -> Self {
+    pub fn new(cache_dir_override: Option<&str>, max_concurrent_proofs: usize) -> Self {
         let cache_dir = PathBuf::from(
             shellexpand::tilde(cache_dir_override.unwrap_or(sn2_types::CIRCUIT_CACHE_DIR))
                 .to_string(),
         );
-        info!(cache_dir = %cache_dir.display(), "initialized DSperseClient");
+        let max_concurrent_proofs =
+            max_concurrent_proofs.clamp(1, tokio::sync::Semaphore::MAX_PERMITS);
+        info!(
+            cache_dir = %cache_dir.display(),
+            max_concurrent_proofs,
+            "initialized DSperseClient"
+        );
 
         let backends: Vec<_> = (0..BACKEND_SHARDS)
             .map(|_| Arc::new(dsperse::backend::jstprove::JstproveBackend::new()))
@@ -340,7 +357,26 @@ impl DSperseClient {
             onnx_cache: RwLock::new(HashMap::new()),
             onnx_initializers_cache: Arc::new(RwLock::new(HashMap::new())),
             whole_model_initializers_cache: Arc::new(RwLock::new(HashMap::new())),
+            proof_slots: Arc::new(tokio::sync::Semaphore::new(max_concurrent_proofs)),
         }
+    }
+
+    /// Waits for a free proof slot (see `proof_slots`). The caller moves the
+    /// permit into the blocking task that runs the proof.
+    async fn acquire_proof_slot(&self) -> Result<tokio::sync::OwnedSemaphorePermit> {
+        let started = Instant::now();
+        let permit = Arc::clone(&self.proof_slots)
+            .acquire_owned()
+            .await
+            .context("proof slots closed")?;
+        let waited = started.elapsed();
+        if waited >= PROOF_SLOT_WAIT_LOG_THRESHOLD {
+            info!(
+                waited_ms = waited.as_millis() as u64,
+                "waited for a free proof slot; more requests are in flight than --max-concurrent-proofs"
+            );
+        }
+        Ok(permit)
     }
 
     fn resolve_slice_onnx(&self, slice_dir: &Path) -> Result<PathBuf> {
@@ -489,8 +525,10 @@ impl DSperseClient {
         let inputs_clone = inputs.clone();
         let backend = self.backend_for(&circuit_path);
         let span = tracing::Span::current();
+        let permit = self.acquire_proof_slot().await?;
 
         tokio::task::spawn_blocking(move || -> Result<ProveArtifacts> {
+            let _permit = permit;
             let _span = span.enter();
             let inputs_bytes = rmp_serde::to_vec_named(&inputs_clone)?;
 
@@ -563,8 +601,10 @@ impl DSperseClient {
         let onnx_initializers_cache = Arc::clone(&self.onnx_initializers_cache);
         let whole_model_initializers_cache = Arc::clone(&self.whole_model_initializers_cache);
         let span = tracing::Span::current();
+        let permit = self.acquire_proof_slot().await?;
 
         tokio::task::spawn_blocking(move || -> Result<ProveArtifacts> {
+            let _permit = permit;
             let _span = span.enter();
             let input_flat = flatten_json_to_f64(&input_data);
             anyhow::ensure!(
@@ -789,5 +829,30 @@ impl DSperseClient {
         })
         .await
         .context("blocking task panicked")?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn proofs_beyond_the_limit_wait_for_a_free_slot() {
+        let client = DSperseClient::new(Some("/nonexistent/sn2-proof-slot-test"), 2);
+        let first = client.acquire_proof_slot().await.unwrap();
+        let _second = client.acquire_proof_slot().await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), client.acquire_proof_slot())
+                .await
+                .is_err(),
+            "a third proof must wait while two slots are held"
+        );
+        drop(first);
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), client.acquire_proof_slot())
+                .await
+                .is_ok(),
+            "a released slot must go to the waiting proof"
+        );
     }
 }

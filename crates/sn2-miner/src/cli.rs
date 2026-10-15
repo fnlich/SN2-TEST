@@ -1,3 +1,5 @@
+use std::num::NonZeroUsize;
+
 use clap::Parser;
 
 #[derive(Parser, Debug)]
@@ -40,11 +42,13 @@ pub struct Cli {
         value_parser = parse_miner_spec,
         conflicts_with = "axon_port",
         help = "Serve several miners from this one process, each with its own \
-                hotkey and QUIC port, e.g. --miner hk1:8091,hk2:8092. Repeat \
-                the flag or separate entries with commas. WALLET defaults to \
-                --wallet-name. All miners share one circuit cache and prover. \
-                Replaces --wallet-hotkey and cannot be combined with \
-                --axon-port."
+                hotkey and QUIC (UDP) port, e.g. --miner hk1:8091,hk2:8092. \
+                Repeat the flag or separate entries with commas. WALLET \
+                defaults to --wallet-name. All miners share one circuit cache \
+                and prover, and --max-concurrent-proofs counts all of their \
+                proofs together. A hotkey not yet registered on the subnet is \
+                served anyway and its axon is registered once it is. Replaces \
+                --wallet-hotkey and cannot be combined with --axon-port."
     )]
     pub miners: Vec<MinerSpec>,
 
@@ -74,6 +78,16 @@ pub struct Cli {
 
     #[arg(long, default_value_t = sn2_types::CIRCUIT_TIMEOUT_SECONDS, value_parser = clap::value_parser!(u64).range(1..))]
     pub handler_timeout: u64,
+
+    #[arg(
+        long,
+        value_name = "N",
+        help = "Most proofs to generate at the same time, across every miner this \
+                process serves. Each proof runs on a single CPU core; requests \
+                beyond the limit wait in arrival order. Defaults to the number of \
+                CPUs available to the process."
+    )]
+    pub max_concurrent_proofs: Option<NonZeroUsize>,
 }
 
 /// One miner identity served by this process.
@@ -211,5 +225,17 @@ mod tests {
     #[test]
     fn rejects_duplicate_ports() {
         assert!(cli(&["--miner", "a:8091,b:8091"]).miner_specs().is_err());
+    }
+
+    #[test]
+    fn proof_concurrency_defaults_to_unset_and_rejects_zero() {
+        assert_eq!(cli(&[]).max_concurrent_proofs, None);
+        assert_eq!(
+            cli(&["--max-concurrent-proofs", "6"])
+                .max_concurrent_proofs
+                .map(NonZeroUsize::get),
+            Some(6)
+        );
+        assert!(Cli::try_parse_from(["sn2-miner", "--max-concurrent-proofs", "0"]).is_err());
     }
 }
