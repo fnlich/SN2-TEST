@@ -24,7 +24,7 @@ members = [
     "crates/sn2-validator",
     "crates/sn2-miner",
 ]
-exclude = ["fuzz", "vendor/btlightning"]
+exclude = ["fuzz", "vendor/btlightning", "vendor/jstprove"]
 resolver = "2"
 
 [workspace.package]
@@ -84,3 +84,10 @@ bittensor-drand = { git = "https://github.com/inference-labs-inc/bittensor-drand
 # rebinding / QUIC path migration). See vendor/btlightning/PATCHED.md.
 [patch.crates-io]
 btlightning = { path = "vendor/btlightning" }
+
+# JSTprove 87a1859f (the rev dsperse pins) with a faster WHIR prover: batched
+# Merkle hashing and less FFT work when opening. Proofs are byte-identical to
+# upstream's. See vendor/jstprove/PATCHED.md.
+[patch."https://github.com/inference-labs-inc/JSTprove.git"]
+tree = { path = "vendor/jstprove/tree" }
+poly_commit = { path = "vendor/jstprove/poly_commit" }

@@ -7,5 +7,13 @@
 # than you deploy to (CI, a dev laptop, a different instance generation),
 # REMOVE this or the resulting binary can crash with an illegal
 # instruction on the mismatched deploy target.
+#
+# -vectorize-slp=false: with target-cpu=native (AVX-512, here and on Turin)
+# LLVM's SLP vectorizer turns tiny-keccak's scalar Keccak-f[1600] into
+# AVX-512 shuffle code that hashed about 3.5x slower on an AVX-512 Intel test
+# host (1085 vs 310 ns per 64-byte hash). Keccak builds the WHIR Merkle trees
+# in every production proof. Turning the SLP vectorizer off made WHIR prove
+# 1.5-1.8x faster there, with byte-identical proofs. Explicit SIMD code, such
+# as the 8-lane Keccak in vendor/jstprove/tree, is not affected.
 [build]
-rustflags = ["-C", "target-cpu=native"]
+rustflags = ["-C", "target-cpu=native", "-C", "llvm-args=-vectorize-slp=false"]

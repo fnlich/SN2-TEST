@@ -4699,7 +4699,6 @@ dependencies = [
 [[package]]
 name = "poly_commit"
 version = "0.4.0"
-source = "git+https://github.com/inference-labs-inc/JSTprove.git?rev=87a1859f3487cf0fb9a463dbfd713b1df4827afc#87a1859f3487cf0fb9a463dbfd713b1df4827afc"
 dependencies = [
  "arith",
  "ark-std",
@@ -7636,10 +7635,10 @@ dependencies = [
 [[package]]
 name = "tree"
 version = "0.4.0"
-source = "git+https://github.com/inference-labs-inc/JSTprove.git?rev=87a1859f3487cf0fb9a463dbfd713b1df4827afc#87a1859f3487cf0fb9a463dbfd713b1df4827afc"
 dependencies = [
  "arith",
  "ark-std",
+ "keccak",
  "serdes",
  "tiny-keccak",
 ]
