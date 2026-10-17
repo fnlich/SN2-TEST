@@ -1,0 +1,20 @@
+# MODIFIED FOR SN2: JSTprove 87a1859f prover/tree/Cargo.toml with the fields
+# it inherited from the JSTprove workspace written out (this copy is outside
+# that workspace), the benches and their dev-dependencies left out, and the
+# keccak dependency added. See ../PATCHED.md.
+[package]
+name = "tree"
+version = "0.4.0"
+edition = "2021"
+
+[dependencies]
+arith = { git = "https://github.com/inference-labs-inc/JSTprove.git", rev = "87a1859f3487cf0fb9a463dbfd713b1df4827afc" }
+serdes = { git = "https://github.com/inference-labs-inc/JSTprove.git", rev = "87a1859f3487cf0fb9a463dbfd713b1df4827afc" }
+
+ark-std = "0.4.0"
+tiny-keccak = { version = "2.0.2", features = ["sha3", "keccak"] }
+# 8-lane Keccak-f[1600] for the batched tree hashing in src/batch.rs.
+keccak = { version = "0.1.6", features = ["simd"] }
+
+[lints.clippy]
+all = "allow"

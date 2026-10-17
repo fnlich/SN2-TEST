@@ -1,0 +1,43 @@
+# MODIFIED FOR SN2: JSTprove 87a1859f prover/poly_commit/Cargo.toml with the
+# fields it inherited from the JSTprove workspace written out (this copy is
+# outside that workspace), and the benches and the dev-dependencies only they
+# use left out. See ../PATCHED.md.
+[package]
+name = "poly_commit"
+version = "0.4.0"
+edition = "2021"
+
+[dependencies]
+arith = { git = "https://github.com/inference-labs-inc/JSTprove.git", rev = "87a1859f3487cf0fb9a463dbfd713b1df4827afc" }
+gf2 = { git = "https://github.com/inference-labs-inc/JSTprove.git", rev = "87a1859f3487cf0fb9a463dbfd713b1df4827afc" }
+gkr_engine = { git = "https://github.com/inference-labs-inc/JSTprove.git", rev = "87a1859f3487cf0fb9a463dbfd713b1df4827afc" }
+polynomials = { git = "https://github.com/inference-labs-inc/JSTprove.git", rev = "87a1859f3487cf0fb9a463dbfd713b1df4827afc" }
+serdes = { git = "https://github.com/inference-labs-inc/JSTprove.git", rev = "87a1859f3487cf0fb9a463dbfd713b1df4827afc" }
+transcript = { git = "https://github.com/inference-labs-inc/JSTprove.git", rev = "87a1859f3487cf0fb9a463dbfd713b1df4827afc" }
+tree = { git = "https://github.com/inference-labs-inc/JSTprove.git", rev = "87a1859f3487cf0fb9a463dbfd713b1df4827afc" }
+utils = { git = "https://github.com/inference-labs-inc/JSTprove.git", rev = "87a1859f3487cf0fb9a463dbfd713b1df4827afc" }
+sumcheck = { git = "https://github.com/inference-labs-inc/JSTprove.git", rev = "87a1859f3487cf0fb9a463dbfd713b1df4827afc" }
+
+ethnum = "1.5.0"
+ark-std = "0.4.0"
+sha2 = "0.10.8"
+derivative = "2.2.0"
+halo2curves = { git = "https://github.com/PolyhedraZK/halo2curves", default-features = false, features = ["bits"] }
+itertools = "0.13.0"
+rand = "0.8.5"
+rayon = "1.10.0"
+transpose = "0.2.3"
+thiserror = "2.0.15"
+
+[dev-dependencies]
+gf2_128 = { git = "https://github.com/inference-labs-inc/JSTprove.git", rev = "87a1859f3487cf0fb9a463dbfd713b1df4827afc" }
+goldilocks = { git = "https://github.com/inference-labs-inc/JSTprove.git", rev = "87a1859f3487cf0fb9a463dbfd713b1df4827afc" }
+gkr_hashers = { git = "https://github.com/inference-labs-inc/JSTprove.git", rev = "87a1859f3487cf0fb9a463dbfd713b1df4827afc" }
+rand_chacha = "0.3.1"
+
+[features]
+default = []
+profile = ["utils/profile"]
+
+[lints.clippy]
+all = "allow"

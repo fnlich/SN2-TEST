@@ -1,0 +1,325 @@
+use std::sync::Arc;
+
+use arith::ExtensionField;
+use serdes::{ExpSerde, SerdeResult};
+use tree::{Node, Path, Tree};
+
+pub const RATE_LOG: usize = 2;
+pub const BASEFOLD_NUM_QUERIES: usize = (crate::PCS_SOUNDNESS_BITS * 2 + RATE_LOG - 1) / RATE_LOG;
+
+#[derive(Clone, Debug, Default)]
+pub struct BasefoldSRS;
+
+impl ExpSerde for BasefoldSRS {
+    fn serialize_into<W: std::io::Write>(&self, _writer: W) -> SerdeResult<()> {
+        Ok(())
+    }
+
+    fn deserialize_from<R: std::io::Read>(_reader: R) -> SerdeResult<Self> {
+        Ok(Self)
+    }
+}
+
+impl gkr_engine::StructuredReferenceString for BasefoldSRS {
+    type PKey = BasefoldSRS;
+    type VKey = BasefoldSRS;
+
+    fn into_keys(self) -> (Self::PKey, Self::VKey) {
+        (BasefoldSRS, BasefoldSRS)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BasefoldCommitment {
+    pub root: Node,
+    pub num_vars: usize,
+}
+
+impl ExpSerde for BasefoldCommitment {
+    fn serialize_into<W: std::io::Write>(&self, mut writer: W) -> SerdeResult<()> {
+        self.root.serialize_into(&mut writer)?;
+        (self.num_vars as u64).serialize_into(&mut writer)?;
+        Ok(())
+    }
+
+    fn deserialize_from<R: std::io::Read>(mut reader: R) -> SerdeResult<Self> {
+        let root = Node::deserialize_from(&mut reader)?;
+        let num_vars = u64::deserialize_from(&mut reader)? as usize;
+        Ok(Self { root, num_vars })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct SumcheckRoundMessage<F: ExtensionField> {
+    pub eval_at_1: F,
+    pub eval_at_2: F,
+}
+
+impl<F: ExtensionField> ExpSerde for SumcheckRoundMessage<F> {
+    fn serialize_into<W: std::io::Write>(&self, mut writer: W) -> SerdeResult<()> {
+        self.eval_at_1.serialize_into(&mut writer)?;
+        self.eval_at_2.serialize_into(&mut writer)?;
+        Ok(())
+    }
+
+    fn deserialize_from<R: std::io::Read>(mut reader: R) -> SerdeResult<Self> {
+        let eval_at_1 = F::deserialize_from(&mut reader)?;
+        let eval_at_2 = F::deserialize_from(&mut reader)?;
+        Ok(Self {
+            eval_at_1,
+            eval_at_2,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BasefoldOpening<F: ExtensionField> {
+    pub round_commitments: Vec<Node>,
+    pub sumcheck_messages: Vec<SumcheckRoundMessage<F>>,
+    pub final_poly: Vec<F>,
+    pub query_proofs: Vec<FriQueryProof<F>>,
+}
+
+impl<F: ExtensionField> ExpSerde for BasefoldOpening<F> {
+    fn serialize_into<W: std::io::Write>(&self, mut writer: W) -> SerdeResult<()> {
+        (self.round_commitments.len() as u64).serialize_into(&mut writer)?;
+        for node in &self.round_commitments {
+            node.serialize_into(&mut writer)?;
+        }
+
+        (self.sumcheck_messages.len() as u64).serialize_into(&mut writer)?;
+        for msg in &self.sumcheck_messages {
+            msg.serialize_into(&mut writer)?;
+        }
+
+        (self.final_poly.len() as u64).serialize_into(&mut writer)?;
+        for f in &self.final_poly {
+            f.serialize_into(&mut writer)?;
+        }
+
+        (self.query_proofs.len() as u64).serialize_into(&mut writer)?;
+        for qp in &self.query_proofs {
+            qp.serialize_into(&mut writer)?;
+        }
+
+        Ok(())
+    }
+
+    fn deserialize_from<R: std::io::Read>(mut reader: R) -> SerdeResult<Self> {
+        const MAX_ROUNDS: u64 = 64;
+        const MAX_SUMCHECK: u64 = 256;
+        const MAX_FINAL_POLY: u64 = 1 << 20;
+        const MAX_QUERIES: u64 = 1 << 16;
+
+        let len = u64::deserialize_from(&mut reader)?;
+        if len > MAX_ROUNDS {
+            return Err(serdes::SerdeError::DeserializeError);
+        }
+        let len = len as usize;
+        let mut round_commitments = Vec::with_capacity(len);
+        for _ in 0..len {
+            round_commitments.push(Node::deserialize_from(&mut reader)?);
+        }
+
+        let slen = u64::deserialize_from(&mut reader)?;
+        if slen > MAX_SUMCHECK {
+            return Err(serdes::SerdeError::DeserializeError);
+        }
+        let slen = slen as usize;
+        let mut sumcheck_messages = Vec::with_capacity(slen);
+        for _ in 0..slen {
+            sumcheck_messages.push(SumcheckRoundMessage::deserialize_from(&mut reader)?);
+        }
+
+        let flen = u64::deserialize_from(&mut reader)?;
+        if flen > MAX_FINAL_POLY {
+            return Err(serdes::SerdeError::DeserializeError);
+        }
+        let flen = flen as usize;
+        let mut final_poly = Vec::with_capacity(flen);
+        for _ in 0..flen {
+            final_poly.push(F::deserialize_from(&mut reader)?);
+        }
+
+        let qlen = u64::deserialize_from(&mut reader)?;
+        if qlen > MAX_QUERIES {
+            return Err(serdes::SerdeError::DeserializeError);
+        }
+        let qlen = qlen as usize;
+        let mut query_proofs = Vec::with_capacity(qlen);
+        for _ in 0..qlen {
+            query_proofs.push(FriQueryProof::deserialize_from(&mut reader)?);
+        }
+
+        Ok(Self {
+            round_commitments,
+            sumcheck_messages,
+            final_poly,
+            query_proofs,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FriQueryProof<F: ExtensionField> {
+    pub initial_leaf_proof: Path,
+    pub initial_sibling_proof: Path,
+    pub round_proofs: Vec<FriRoundProof<F>>,
+}
+
+impl<F: ExtensionField> ExpSerde for FriQueryProof<F> {
+    fn serialize_into<W: std::io::Write>(&self, mut writer: W) -> SerdeResult<()> {
+        self.initial_leaf_proof.serialize_into(&mut writer)?;
+        self.initial_sibling_proof.serialize_into(&mut writer)?;
+        (self.round_proofs.len() as u64).serialize_into(&mut writer)?;
+        for rp in &self.round_proofs {
+            rp.serialize_into(&mut writer)?;
+        }
+        Ok(())
+    }
+
+    fn deserialize_from<R: std::io::Read>(mut reader: R) -> SerdeResult<Self> {
+        const MAX_ROUNDS: u64 = 64;
+        let initial_leaf_proof = Path::deserialize_from(&mut reader)?;
+        let initial_sibling_proof = Path::deserialize_from(&mut reader)?;
+        let len = u64::deserialize_from(&mut reader)?;
+        if len > MAX_ROUNDS {
+            return Err(serdes::SerdeError::DeserializeError);
+        }
+        let len = len as usize;
+        let mut round_proofs = Vec::with_capacity(len);
+        for _ in 0..len {
+            round_proofs.push(FriRoundProof::deserialize_from(&mut reader)?);
+        }
+        Ok(Self {
+            initial_leaf_proof,
+            initial_sibling_proof,
+            round_proofs,
+        })
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct FriRoundProof<F: ExtensionField> {
+    pub leaf_proof: Path,
+    pub sibling_proof: Path,
+    pub leaf_values: Vec<F>,
+    pub sibling_values: Vec<F>,
+}
+
+impl<F: ExtensionField> ExpSerde for FriRoundProof<F> {
+    fn serialize_into<W: std::io::Write>(&self, mut writer: W) -> SerdeResult<()> {
+        self.leaf_proof.serialize_into(&mut writer)?;
+        self.sibling_proof.serialize_into(&mut writer)?;
+        (self.leaf_values.len() as u64).serialize_into(&mut writer)?;
+        for v in &self.leaf_values {
+            v.serialize_into(&mut writer)?;
+        }
+        (self.sibling_values.len() as u64).serialize_into(&mut writer)?;
+        for v in &self.sibling_values {
+            v.serialize_into(&mut writer)?;
+        }
+        Ok(())
+    }
+
+    fn deserialize_from<R: std::io::Read>(mut reader: R) -> SerdeResult<Self> {
+        const MAX_VALUES: u64 = 1 << 16;
+        let leaf_proof = Path::deserialize_from(&mut reader)?;
+        let sibling_proof = Path::deserialize_from(&mut reader)?;
+        let llen = u64::deserialize_from(&mut reader)?;
+        if llen > MAX_VALUES {
+            return Err(serdes::SerdeError::DeserializeError);
+        }
+        let llen = llen as usize;
+        let mut leaf_values = Vec::with_capacity(llen);
+        for _ in 0..llen {
+            leaf_values.push(F::deserialize_from(&mut reader)?);
+        }
+        let slen = u64::deserialize_from(&mut reader)?;
+        if slen > MAX_VALUES {
+            return Err(serdes::SerdeError::DeserializeError);
+        }
+        let slen = slen as usize;
+        let mut sibling_values = Vec::with_capacity(slen);
+        for _ in 0..slen {
+            sibling_values.push(F::deserialize_from(&mut reader)?);
+        }
+        Ok(Self {
+            leaf_proof,
+            sibling_proof,
+            leaf_values,
+            sibling_values,
+        })
+    }
+}
+
+struct ErasedCodeword(Box<dyn std::any::Any + Send + Sync>);
+
+impl std::fmt::Debug for ErasedCodeword {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ErasedCodeword")
+    }
+}
+
+pub struct BasefoldScratchPad {
+    commit_cache: Option<Arc<(Tree, ErasedCodeword, usize)>>,
+}
+
+impl Clone for BasefoldScratchPad {
+    fn clone(&self) -> Self {
+        Self {
+            commit_cache: self.commit_cache.clone(),
+        }
+    }
+}
+
+impl std::fmt::Debug for BasefoldScratchPad {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BasefoldScratchPad")
+            .field("cached", &self.commit_cache.is_some())
+            .finish()
+    }
+}
+
+impl Default for BasefoldScratchPad {
+    fn default() -> Self {
+        Self { commit_cache: None }
+    }
+}
+
+impl BasefoldScratchPad {
+    pub(crate) fn store_commit<F: Send + Sync + 'static>(
+        &mut self,
+        tree: Tree,
+        codeword: Vec<F>,
+        num_evals: usize,
+    ) {
+        self.commit_cache = Some(Arc::new((
+            tree,
+            ErasedCodeword(Box::new(codeword)),
+            num_evals,
+        )));
+    }
+
+    pub(crate) fn get_commit<F: Send + Sync + 'static>(
+        &self,
+        num_evals: usize,
+    ) -> Option<(&Tree, &Vec<F>)> {
+        let arc = self.commit_cache.as_ref()?;
+        if arc.2 != num_evals {
+            return None;
+        }
+        let codeword = arc.1 .0.downcast_ref::<Vec<F>>()?;
+        Some((&arc.0, codeword))
+    }
+}
+
+impl ExpSerde for BasefoldScratchPad {
+    fn serialize_into<W: std::io::Write>(&self, _writer: W) -> SerdeResult<()> {
+        Ok(())
+    }
+
+    fn deserialize_from<R: std::io::Read>(_reader: R) -> SerdeResult<Self> {
+        Ok(Self::default())
+    }
+}
