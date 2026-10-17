@@ -6,7 +6,14 @@
 # arithmetic-heavy proving path. If you ever build on a different machine
 # than you deploy to (CI, a dev laptop, a different instance generation),
 # REMOVE this or the resulting binary can crash with an illegal
-# instruction on the mismatched deploy target.
+# instruction on the mismatched deploy target. In that case remove only
+# "-C", "target-cpu=native" and keep the flag below.
+#
+# These flags are dropped, without any message, when RUSTFLAGS or
+# CARGO_ENCODED_RUSTFLAGS is set, or when a [target.<triple>] rustflags entry
+# applies (also one in ~/.cargo/config.toml). Before building, check that
+# `env | grep -i rustflags` prints nothing and that ~/.cargo/config.toml, if
+# it exists, has no rustflags line.
 #
 # -vectorize-slp=false: with target-cpu=native (AVX-512, here and on Turin)
 # LLVM's SLP vectorizer turns tiny-keccak's scalar Keccak-f[1600] into

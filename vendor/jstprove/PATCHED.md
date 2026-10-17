@@ -40,9 +40,11 @@ more for every out-of-domain sample.
     The coefficients it no longer evaluates, above the polynomial's degree,
     are zero.
   - The re-encoding FFT and inverse FFT multiply by base-field twiddles
-    (`mul_by_base_field`) when the extension field's root of unity is the
-    embedded base-field root, which is the case for `GoldilocksExt4`. For any
-    other field they fall back to the upstream transforms.
+    (`mul_by_base_field`) when the extension field's generator of the FFT
+    subgroup is the embedded base-field generator. That holds for
+    `GoldilocksExt4` and `GoldilocksExt3` at every size, and for
+    `GoldilocksExt2` up to 2^32. Otherwise they fall back to the upstream
+    transforms.
 - Both `Cargo.toml` files spell out what they inherited from the JSTprove
   workspace (same versions and features). They point the other JSTprove
   crates at the pinned git rev and drop the benches.
@@ -61,7 +63,7 @@ upstream's, so validators running unmodified JSTprove accept them.
   All unit tests of both crates pass, JSTprove's own included: 112 in
   `poly_commit` (101 of them WHIR round trips and adversarial cases) and 3 in
   `tree`.
-- Production slices 20, 21 and 74 of rfdetr-nano, proved by the miner's
+- Production slices 20, 21, 74 and 153 of rfdetr-nano, proved by the miner's
   request path with the same build flags as this repo:
   - the proof, witness and output bytes are identical to an unpatched build's;
   - a validator-equivalent unpatched verifier accepts every proof.
@@ -76,16 +78,25 @@ upstream's, so validators running unmodified JSTprove accept them.
 
 ## Updating
 
-When dsperse moves to another JSTprove rev, these copies no longer match the
-crates they replace. Cargo then warns that the patch was not used and builds
-the unpatched crates, so proving keeps working without the speedup. To keep the
-speedup:
+The `[patch]` matches JSTprove's git URL, not its rev, and JSTprove's crates
+depend on `tree` and `poly_commit` without a version requirement. So when
+dsperse moves to another JSTprove rev, Cargo still uses these copies. They
+pull in a second copy of the other JSTprove crates at 87a1859f, and **the
+build fails** with type errors and notes about multiple different versions of
+crate `arith`. Cargo gives no warning beforehand, and there is no fallback to
+the unpatched crates.
 
-1. Copy `src/` and `Cargo.toml` of the two crates from the new rev.
-2. Re-apply the changes marked `MODIFIED FOR SN2`.
-3. Update the `rev` in both manifests.
-4. Before deploying, check that proofs are still byte-identical to an
-   unpatched build's.
+Before building a change that moves dsperse's JSTprove rev (check the
+`source` lines of the JSTprove packages in `Cargo.lock`), do one of these:
 
-If upstream adopts equivalent changes, delete `vendor/jstprove` and the
-`[patch]` entry.
+- Re-vendor, to keep the speedup:
+  1. Copy `src/` and `Cargo.toml` of the two crates from the new rev.
+  2. Re-apply the changes marked `MODIFIED FOR SN2`.
+  3. Update the `rev` in both manifests.
+  4. Before deploying, check that proofs are still byte-identical to an
+     unpatched build's.
+- Or go back to stock JSTprove: delete the
+  `[patch."https://github.com/inference-labs-inc/JSTprove.git"]` block in the
+  workspace `Cargo.toml` and `vendor/jstprove`.
+
+If upstream adopts equivalent changes, remove the patch the same way.
